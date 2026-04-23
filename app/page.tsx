@@ -442,7 +442,7 @@ export default function LangPi() {
   // ── Auto-save lên Supabase (debounce 2s) ──
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
-    if (!username || username === 'Unknown') return
+    if (!username || username === 'Unknown' || username === '...' || username === '❌') return
     if (saveTimer.current) clearTimeout(saveTimer.current)
     saveTimer.current = setTimeout(async () => {
       const farm: FarmRow = {

@@ -1,5 +1,3 @@
-// ─── Pi Network Authentication ────────────────────────────────────────────
-
 export interface PiUser {
   username: string
   uid: string
@@ -25,14 +23,13 @@ declare global {
 
 const IS_SANDBOX = process.env.NEXT_PUBLIC_PI_SANDBOX === 'true'
 
-// ─── Chờ Pi SDK load (tối đa 10 giây) ────────────────────────────────────
 function waitForPiSDK(timeoutMs = 10000): Promise<boolean> {
   return new Promise((resolve) => {
     if (typeof window === 'undefined') { resolve(false); return }
-    if (window.Pi) { resolve(true); return }
+    if (typeof window.Pi !== 'undefined') { resolve(true); return }
     const start = Date.now()
     const check = setInterval(() => {
-      if (window.Pi) {
+      if (typeof window.Pi !== 'undefined') {
         clearInterval(check)
         resolve(true)
       } else if (Date.now() - start > timeoutMs) {
@@ -43,19 +40,17 @@ function waitForPiSDK(timeoutMs = 10000): Promise<boolean> {
   })
 }
 
-// ─── Authenticate ─────────────────────────────────────────────────────────
 export async function authenticateWithPi(): Promise<PiUser | null> {
   if (typeof window === 'undefined') return null
 
   const sdkReady = await waitForPiSDK()
 
-  if (!sdkReady || !window.Pi) {
-    console.warn('[Pi Auth] SDK không load được — không trong PiBrowser')
+  if (!sdkReady || typeof window.Pi === 'undefined') {
+    console.warn('[Pi Auth] Không tìm thấy window.Pi')
     return null
   }
 
   try {
-    // Init TRƯỚC rồi mới authenticate
     window.Pi.init({ version: '2.0', sandbox: IS_SANDBOX })
 
     const auth = await window.Pi.authenticate(
@@ -65,7 +60,7 @@ export async function authenticateWithPi(): Promise<PiUser | null> {
       }
     )
 
-    console.log('[Pi Auth] ✅ Thành công:', auth.user.username)
+    console.log('[Pi Auth] ✅ OK:', auth.user.username)
     return auth.user
 
   } catch (err) {
@@ -78,7 +73,7 @@ export function isInPiBrowser(): boolean {
   if (typeof window === 'undefined') return false
   return (
     navigator.userAgent.includes('PiBrowser') ||
-    !!window.Pi ||
+    typeof window.Pi !== 'undefined' ||
     IS_SANDBOX
   )
 }
