@@ -4,7 +4,7 @@ import './globals.css'
 export const metadata: Metadata = {
   title: 'Làng Pi',
   description: 'Farm game on Pi Network',
-    generator: 'v0.app'
+  generator: 'v0.app'
 }
 
 export default function RootLayout({
@@ -14,3 +14,12 @@ export default function RootLayout({
 }) {
   return (
     <html lang="vi">
+      <head>
+        <script src="https://sdk.minepi.com/pi-sdk.js" async></script>
+      </head>
+      <body>
+        {children}
+      </body>
+    </html>
+  )
+}
