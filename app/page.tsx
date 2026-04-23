@@ -1,3 +1,5 @@
+DIALOG REPLACED OK
+INIT REPLACED OK
 'use client'
 
 import { useState, useRef, useCallback, useEffect } from 'react'
@@ -309,7 +311,7 @@ export default function LangPi() {
   const [coins, setCoins]           = useState<CoinFx[]>([])
   const [showUsernameInput, setShowUsernameInput] = useState(false)
   const [inventory, setInventory]   = useState<Record<string, number>>(INITIAL_INVENTORY)
-  const [tempUsername, setTempUsername] = useState('')
+
   const coinId                      = useRef(0)
 
   // Modal states
@@ -339,40 +341,24 @@ export default function LangPi() {
   // ── Initialize game — Pi SDK Authentication ──
   useEffect(() => {
     const init = async () => {
-      // Hiện loading state
       setUsername('...')
 
-      // 1. Authenticate với Pi Network
-      // Pi Browser sẽ tự xử lý — user KHÔNG cần làm gì thêm
+      // 1. Authenticate với Pi — PiBrowser tự xử lý
       const piUser = await authenticateWithPi()
 
       if (!piUser) {
-        // Không trong Pi Browser (dev/test) — thử load cache hoặc hỏi username
-        const cache = loadLocalCache()
-        if (cache && cache.username && cache.username !== 'Unknown') {
-          const s = rowToState(cache)
-          setUsername(s.username)
-          setPlots(resolveReadyPlots(s.plots))
-          setPi(s.piBalance); setStars(s.stars)
-          setCharPos(s.charPos); setInventory(s.inventory)
-          setGameState({ username: s.username, piBalance: s.piBalance, stars: s.stars, plots: s.plots, charPos: s.charPos, inventory: s.inventory })
-          loadNotifications(s.username)
-          setupRealtime(s.username)
-        } else {
-          setUsername('')
-          setShowUsernameInput(true) // fallback: nhập tay khi dev
-        }
+        // Không lấy được Pi user — hiện màn chờ thay vì hỏi username
+        setUsername('❌')
         return
       }
 
-      // 2. Có Pi user — dùng username Pi làm key
+      // 2. Có Pi user
       const uname = piUser.username
       setUsername(uname)
 
       // 3. Load farm từ Supabase
       let row = await loadFarm(uname)
       if (!row) {
-        // Người chơi mới
         row = {
           username: uname, pi_balance: 10, stars: 0,
           plots: INITIAL_PLOTS, inventory: INITIAL_INVENTORY,
@@ -384,14 +370,11 @@ export default function LangPi() {
       const s = rowToState(row)
       const resolvedPlots = resolveReadyPlots(s.plots)
       setPlots(resolvedPlots); setPi(s.piBalance); setStars(s.stars)
-      setCharPos(s.charPos);   setInventory(s.inventory)
+      setCharPos(s.charPos); setInventory(s.inventory)
       saveLocalCache({ ...row, plots: resolvedPlots })
       setGameState({ username: uname, piBalance: s.piBalance, stars: s.stars, plots: resolvedPlots, charPos: s.charPos, inventory: s.inventory })
 
-      // 4. Load thông báo thăm vườn
       loadNotifications(uname)
-
-      // 5. Realtime
       const cleanup = setupRealtime(uname)
       return cleanup
     }
@@ -1377,56 +1360,43 @@ export default function LangPi() {
         </DialogContent>
       </Dialog>
 
-      {/* USERNAME INPUT DIALOG */}
-      <Dialog open={showUsernameInput} onOpenChange={setShowUsernameInput}>
-        <DialogContent className="rounded-2xl border-t-4 border-yellow-300 max-w-sm mx-auto"
-                        style={{ background: 'linear-gradient(180deg,#fff9e6,#fffde7)' }}>
-          <DialogHeader>
-            <DialogTitle style={{ fontFamily:"'Baloo 2',cursive" }} className="text-center text-xl">
-              👤 Bạn là ai?
-            </DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4">
-            <p className="text-sm text-center text-slate-700">
-              Không tìm thấy username Pi của bạn. Vui lòng nhập tên người dùng Pi:
-            </p>
-            <input
-              type="text"
-              placeholder="VD: minhtrieuphu"
-              value={tempUsername}
-              onChange={(e) => setTempUsername(e.target.value)}
-              onKeyPress={(e) => {
-                if (e.key === 'Enter' && tempUsername.trim()) {
-                  const uname = tempUsername.trim()
-                  setUsername(uname)
-                  setShowUsernameInput(false)
-                  const farm: FarmRow = { username: uname, pi_balance: piBalance, stars, plots, inventory, char_pos: charPos }
-                  saveLocalCache(farm)
-                  saveFarm(farm)
-                }
-              }}
-              className="w-full px-4 py-3 border-2 border-slate-300 rounded-xl focus:border-yellow-400 focus:outline-none font-semibold"
-              autoFocus
-            />
-            <button
-              onClick={() => {
-                if (tempUsername.trim()) {
-                  const uname = tempUsername.trim()
-                  setUsername(uname)
-                  setShowUsernameInput(false)
-                  const farm: FarmRow = { username: uname, pi_balance: piBalance, stars, plots, inventory, char_pos: charPos }
-                  saveLocalCache(farm)
-                  saveFarm(farm)
-                } else {
-                  showToast('❌ Vui lòng nhập username!')
-                }
-              }}
-              className="w-full bg-gradient-to-br from-violet-600 to-violet-800 text-white font-black text-sm py-3 rounded-xl shadow-[0_4px_0_#3b0764] active:translate-y-1 active:shadow-none">
-              ✓ Xác nhận
-            </button>
+      {/* LOADING SCREEN */}
+      {(username === '...' || username === '') && (
+        <div className="fixed inset-0 z-[900] flex flex-col items-center justify-center"
+             style={{ background: 'linear-gradient(135deg,#1a0533 0%,#2d0a5e 50%,#1a0533 100%)' }}>
+          <div style={{ fontSize:72, animation:'piFloat 2s ease-in-out infinite', marginBottom:16,
+                        filter:'drop-shadow(0 0 24px rgba(168,85,247,0.9))' }}>π</div>
+          <div className="text-white text-xl font-black mb-2" style={{ fontFamily:"'Baloo 2',cursive" }}>
+            Làng Pi
           </div>
-        </DialogContent>
-      </Dialog>
+          <div className="text-purple-300 text-sm mb-8">Đang kết nối Pi Network...</div>
+          <div className="flex gap-2">
+            {[0,1,2].map(i => (
+              <div key={i} className="w-2.5 h-2.5 rounded-full bg-purple-400"
+                   style={{ animation: `spark 1.2s ease-in-out ${i*0.2}s infinite` }} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* LỖI KHÔNG VÀO ĐƯỢC PIBROWSER */}
+      {username === '❌' && (
+        <div className="fixed inset-0 z-[900] flex flex-col items-center justify-center px-8"
+             style={{ background: 'linear-gradient(135deg,#1a0533 0%,#2d0a5e 50%,#1a0533 100%)' }}>
+          <div style={{ fontSize:56, marginBottom:16 }}>😢</div>
+          <div className="text-white text-lg font-black mb-3 text-center" style={{ fontFamily:"'Baloo 2',cursive" }}>
+            Cần mở bằng Pi Browser
+          </div>
+          <div className="text-purple-300 text-sm text-center mb-6 leading-relaxed">
+            Game này chỉ chạy trong Pi Browser.<br/>
+            Vui lòng mở link bằng ứng dụng Pi Browser.
+          </div>
+          <button onClick={() => window.location.reload()}
+                  className="bg-purple-600 text-white font-black px-8 py-3 rounded-xl active:scale-95">
+            🔄 Thử lại
+          </button>
+        </div>
+      )}
     </div>
   )
 }
