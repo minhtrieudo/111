@@ -14,7 +14,3 @@ export default function RootLayout({
 }) {
   return (
     <html lang="vi">
-      <body>{children}</body>
-    </html>
-  )
-}

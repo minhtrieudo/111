@@ -8,6 +8,7 @@ import {
   applyVisitAction, logVisitEvent, loadUnseenVisits, markVisitsSeen,
   type FarmRow, type VisitLogRow
 } from '@/lib/supabase'
+import { authenticateWithPi, isInPiBrowser, type PiUser } from '@/lib/pi-auth'
 
 // ─── TYPES ───────────────────────────────────────────────────────────
 type PlotState = 'grass' | 'tilled' | 'seeded' | 'growing' | 'watered' | 'ready' | 'buy'
@@ -160,20 +161,7 @@ const VISIT_MESSAGES = {
 // ─── STORAGE HELPERS (Supabase) ───────────────────────────────────────
 
 
-// ─── STORAGE HELPERS (Supabase) ───────────────────────────────────────
-const getPiUsername = (): string | null => {
-  if (typeof window !== 'undefined') {
-    const piUser = (window as any).pi?.user
-    if (piUser?.username) return piUser.username
-    const keys = ['pi_user_username','pi_username','username','user_username','piUsername']
-    for (const k of keys) {
-      const v = localStorage.getItem(k) || sessionStorage.getItem(k)
-      if (v) return v
-    }
-  }
-  return null
-}
-
+// ─── STORAGE HELPERS (Supabase + Pi Auth) ─────────────────────────────────
 // Cache local để không mất data khi mạng chậm
 const LOCAL_KEY = 'lang_pi_game_state'
 
@@ -340,48 +328,57 @@ export default function LangPi() {
   // Social system
   const [villageModal, setVillageModal] = useState(false)
   const [visitTarget, setVisitTarget] = useState('')
-  const [visitingState, setVisitingState] = useState<{ username: string; plots: Plot[] } | null>(null)
+  const [visitingState, setVisitingState] = useState<{ username: string; plots: Plot[]; charPos: {x:number;y:number} } | null>(null)
+  const [visitPopup, setVisitPopup] = useState<{ idx: number; x: number; y: number } | null>(null)
   const [notifications, setNotifications] = useState<string[]>([])
   const [notifModal, setNotifModal] = useState(false)
 
   const worldRef = useRef<HTMLDivElement>(null)
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // ── Initialize game on mount (Supabase) ──
+  // ── Initialize game — Pi SDK Authentication ──
   useEffect(() => {
     const init = async () => {
-      const piUser = getPiUsername()
-      const uname  = piUser || 'Unknown'
+      // Hiện loading state
+      setUsername('...')
 
-      if (uname === 'Unknown') {
-        // Thử load cache local trước
+      // 1. Authenticate với Pi Network
+      // Pi Browser sẽ tự xử lý — user KHÔNG cần làm gì thêm
+      const piUser = await authenticateWithPi()
+
+      if (!piUser) {
+        // Không trong Pi Browser (dev/test) — thử load cache hoặc hỏi username
         const cache = loadLocalCache()
-        if (cache) {
+        if (cache && cache.username && cache.username !== 'Unknown') {
           const s = rowToState(cache)
-          setUsername(s.username); setPlots(resolveReadyPlots(s.plots))
-          setPi(s.piBalance); setStars(s.stars); setCharPos(s.charPos); setInventory(s.inventory)
+          setUsername(s.username)
+          setPlots(resolveReadyPlots(s.plots))
+          setPi(s.piBalance); setStars(s.stars)
+          setCharPos(s.charPos); setInventory(s.inventory)
+          setGameState({ username: s.username, piBalance: s.piBalance, stars: s.stars, plots: s.plots, charPos: s.charPos, inventory: s.inventory })
+          loadNotifications(s.username)
+          setupRealtime(s.username)
+        } else {
+          setUsername('')
+          setShowUsernameInput(true) // fallback: nhập tay khi dev
         }
-        setShowUsernameInput(true)
         return
       }
 
+      // 2. Có Pi user — dùng username Pi làm key
+      const uname = piUser.username
       setUsername(uname)
 
-      // Load từ Supabase
+      // 3. Load farm từ Supabase
       let row = await loadFarm(uname)
-
       if (!row) {
-        // Người chơi mới — tạo farm
-        const newFarm: FarmRow = {
-          username:   uname,
-          pi_balance: 10,
-          stars:      0,
-          plots:      INITIAL_PLOTS,
-          inventory:  INITIAL_INVENTORY,
-          char_pos:   { x: 28, y: 38 },
+        // Người chơi mới
+        row = {
+          username: uname, pi_balance: 10, stars: 0,
+          plots: INITIAL_PLOTS, inventory: INITIAL_INVENTORY,
+          char_pos: { x: 28, y: 38 },
         }
-        await saveFarm(newFarm)
-        row = newFarm
+        await saveFarm(row)
       }
 
       const s = rowToState(row)
@@ -391,55 +388,62 @@ export default function LangPi() {
       saveLocalCache({ ...row, plots: resolvedPlots })
       setGameState({ username: uname, piBalance: s.piBalance, stars: s.stars, plots: resolvedPlots, charPos: s.charPos, inventory: s.inventory })
 
-      // Kiểm tra thông báo thăm vườn
-      const visits = await loadUnseenVisits(uname)
-      if (visits.length > 0) {
-        const msgs = visits.map(ev => {
-          const plantName = ev.plant ? (SEED_INFO[ev.plant]?.name || ev.plant) : 'vườn'
-          if (ev.type === 'water') return getRandomMsg(VISIT_MESSAGES.water, ev.visitor, plantName)
-          if (ev.type === 'pest')  return getRandomMsg(VISIT_MESSAGES.pest,  ev.visitor, plantName)
-          if (ev.type === 'steal') return getRandomMsg(VISIT_MESSAGES.steal, ev.visitor, plantName, ev.amount || 5)
-          return ''
-        }).filter(Boolean)
-        setNotifications(msgs)
-        setNotifModal(true)
-        await markVisitsSeen(uname)
-      }
+      // 4. Load thông báo thăm vườn
+      loadNotifications(uname)
 
-      // Realtime: cập nhật khi có người thăm vườn
-      const channel = supabase
-        .channel(`farm_${uname}`)
-        .on('postgres_changes', {
-          event: 'UPDATE', schema: 'public', table: 'farms',
-          filter: `username=eq.${uname}`
-        }, payload => {
-          const updated = payload.new as FarmRow
-          setPlots(resolveReadyPlots(updated.plots))
-          setPi(updated.pi_balance)
-          setInventory(updated.inventory)
-        })
-        .on('postgres_changes', {
-          event: 'INSERT', schema: 'public', table: 'visit_logs',
-          filter: `target=eq.${uname}`
-        }, payload => {
-          const ev = payload.new as VisitLogRow
-          const plantName = ev.plant ? (SEED_INFO[ev.plant]?.name || ev.plant) : 'vườn'
-          let msg = ''
-          if (ev.type === 'water') msg = getRandomMsg(VISIT_MESSAGES.water, ev.visitor, plantName)
-          if (ev.type === 'pest')  msg = getRandomMsg(VISIT_MESSAGES.pest,  ev.visitor, plantName)
-          if (ev.type === 'steal') msg = getRandomMsg(VISIT_MESSAGES.steal, ev.visitor, plantName, ev.amount || 5)
-          if (msg) {
-            setNotifications(n => [...n, msg])
-            setNotifModal(true)
-          }
-        })
-        .subscribe()
-
-      return () => { supabase.removeChannel(channel) }
+      // 5. Realtime
+      const cleanup = setupRealtime(uname)
+      return cleanup
     }
 
     init()
   }, [])
+
+  // Tách helper load notifications
+  const loadNotifications = async (uname: string) => {
+    const visits = await loadUnseenVisits(uname)
+    if (visits.length > 0) {
+      const msgs = visits.map(ev => {
+        const plantName = ev.plant ? (SEED_INFO[ev.plant]?.name || ev.plant) : 'vườn'
+        if (ev.type === 'water') return getRandomMsg(VISIT_MESSAGES.water, ev.visitor, plantName)
+        if (ev.type === 'pest')  return getRandomMsg(VISIT_MESSAGES.pest,  ev.visitor, plantName)
+        if (ev.type === 'steal') return getRandomMsg(VISIT_MESSAGES.steal, ev.visitor, plantName, ev.amount || 5)
+        return ''
+      }).filter(Boolean)
+      setNotifications(msgs)
+      setNotifModal(true)
+      await markVisitsSeen(uname)
+    }
+  }
+
+  // Tách helper setup realtime
+  const setupRealtime = (uname: string) => {
+    const channel = supabase
+      .channel(`farm_${uname}`)
+      .on('postgres_changes', {
+        event: 'UPDATE', schema: 'public', table: 'farms',
+        filter: `username=eq.${uname}`
+      }, payload => {
+        const updated = payload.new as FarmRow
+        setPlots(resolveReadyPlots(updated.plots))
+        setPi(updated.pi_balance)
+        setInventory(updated.inventory)
+      })
+      .on('postgres_changes', {
+        event: 'INSERT', schema: 'public', table: 'visit_logs',
+        filter: `target=eq.${uname}`
+      }, payload => {
+        const ev = payload.new as VisitLogRow
+        const plantName = ev.plant ? (SEED_INFO[ev.plant]?.name || ev.plant) : 'vườn'
+        let msg = ''
+        if (ev.type === 'water') msg = getRandomMsg(VISIT_MESSAGES.water, ev.visitor, plantName)
+        if (ev.type === 'pest')  msg = getRandomMsg(VISIT_MESSAGES.pest,  ev.visitor, plantName)
+        if (ev.type === 'steal') msg = getRandomMsg(VISIT_MESSAGES.steal, ev.visitor, plantName, ev.amount || 5)
+        if (msg) { setNotifications(n => [...n, msg]); setNotifModal(true) }
+      })
+      .subscribe()
+    return () => { supabase.removeChannel(channel) }
+  }
 
   // Helper: resolve plots đã chín khi load
   const resolveReadyPlots = (plots: Plot[]) => plots.map(plot => {
@@ -671,24 +675,31 @@ export default function LangPi() {
     showToast('🔍 Đang tìm vườn...')
     const row = await loadVisitFarm(targetUser)
     if (!row) { showToast(`❌ Không tìm thấy vườn của "${targetUser}"`); return }
-    setVisitingState({ username: targetUser, plots: row.plots as Plot[] })
+    setVisitingState({
+      username: targetUser,
+      plots: row.plots as Plot[],
+      charPos: row.char_pos || { x: 28, y: 38 }
+    })
     setVillageModal(false)
-    showToast(`🚶 Đang thăm vườn ${targetUser}!`)
   }, [username, showToast])
+
+  // ── tap ô đất khi đang thăm vườn ──
+  const handleVisitPlotTap = useCallback((idx: number, e: React.MouseEvent) => {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    setVisitPopup({ idx, x: rect.left, y: rect.top })
+  }, [])
 
   // ── hành động trên vườn bạn (Supabase) ──
   const doVisitAction = useCallback(async (act: 'water' | 'pest' | 'steal', plotIdx: number) => {
     if (!visitingState) return
     const plot = visitingState.plots[plotIdx]
     if (!plot || !['growing','watered','ready'].includes(plot.state)) {
-      showToast('⚠️ Ô này không có gì để làm~'); return
+      showToast('⚠️ Ô này không có gì để làm~'); setVisitPopup(null); return
     }
 
     const { updatedPlots, stolen } = await applyVisitAction(
       visitingState.username, plotIdx, act, visitingState.plots
     )
-
-    // Ghi log để chủ vườn thấy thông báo
     await logVisitEvent({
       target:   visitingState.username,
       visitor:  username,
@@ -698,14 +709,15 @@ export default function LangPi() {
       amount:   act === 'steal' ? 5 : (act === 'water' ? 20 : 15),
     })
 
-    if (act === 'water')       showToast(`💧 Đã tưới cây cho ${visitingState.username}!`)
-    else if (act === 'pest')   showToast(`🐛 Bắt sâu xong! ${visitingState.username} sẽ cảm ơn bạn~`)
+    if (act === 'water')      showToast(`💧 Tưới xong! ${visitingState.username} sẽ vui lắm~`)
+    else if (act === 'pest')  showToast(`🐛 Bắt sâu xong! Cây của ${visitingState.username} sạch rồi!`)
     else if (act === 'steal') {
       setPi(b => Math.round((b + stolen) * 100) / 100)
       showToast(`🥷 Cuỗm được ${stolen}π! Chạy mau~`)
     }
 
     setVisitingState(v => v ? { ...v, plots: updatedPlots } : null)
+    setVisitPopup(null)
   }, [visitingState, username, showToast])
   const nextPlotPrice = Math.round(plots.length * 1.5 * 10) / 10
 
@@ -771,26 +783,39 @@ export default function LangPi() {
         bg-gradient-to-b from-black/60 to-transparent flex items-center justify-between">
         <div style={{ fontFamily: "'Baloo 2', cursive" }}
              className="text-white text-lg font-bold drop-shadow-[2px_2px_0_rgba(0,0,0,0.5)]">
-          {username ? (
-            <span>
-              <span className="text-yellow-400">👤 {username}</span>
+          {visitingState ? (
+            <button onClick={() => { setVisitingState(null); setVisitPopup(null) }}
+                    className="flex items-center gap-1.5 bg-white/20 rounded-full px-3 py-1 active:scale-95">
+              <span className="text-sm">←</span>
+              <span className="text-yellow-300 text-sm">🏡 {visitingState.username}</span>
+              <span className="text-white/60 text-[10px] font-normal">Về nhà</span>
+            </button>
+          ) : username ? (
+            <span><span className="text-yellow-400">👤 {username}</span>
               <span className="text-xs text-white/60 font-normal ml-1" style={{ fontFamily: 'Nunito' }}>Lv.7</span>
             </span>
           ) : (
-            <span>
-              Làng <span className="text-yellow-400">Pi</span>{' '}
+            <span>Làng <span className="text-yellow-400">Pi</span>{' '}
               <span className="text-xs text-white/60 font-normal" style={{ fontFamily: 'Nunito' }}>Lv.7</span>
             </span>
           )}
         </div>
         <div className="flex gap-1.5">
-          <div className="flex items-center gap-1 bg-black/50 border border-white/20 rounded-full px-2.5 py-1 text-white text-xs font-black backdrop-blur">
-            <div className="w-4 h-4 rounded-full bg-violet-600 flex items-center justify-center text-[9px] font-black">π</div>
-            <span id="pi-display">{piBalance.toFixed(1)}</span>
-          </div>
-          <div className="flex items-center gap-1 bg-black/50 border border-white/20 rounded-full px-2.5 py-1 text-white text-xs font-black backdrop-blur">
-            ⭐{stars}
-          </div>
+          {visitingState ? (
+            <div className="flex items-center gap-1 bg-orange-500/70 border border-orange-300/40 rounded-full px-2.5 py-1 text-white text-[10px] font-black backdrop-blur">
+              👀 Đang thăm
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center gap-1 bg-black/50 border border-white/20 rounded-full px-2.5 py-1 text-white text-xs font-black backdrop-blur">
+                <div className="w-4 h-4 rounded-full bg-violet-600 flex items-center justify-center text-[9px] font-black">π</div>
+                <span id="pi-display">{piBalance.toFixed(1)}</span>
+              </div>
+              <div className="flex items-center gap-1 bg-black/50 border border-white/20 rounded-full px-2.5 py-1 text-white text-xs font-black backdrop-blur">
+                ⭐{stars}
+              </div>
+            </>
+          )}
         </div>
       </div>
 
@@ -885,21 +910,71 @@ export default function LangPi() {
           onPond={() => showToast('🐟 Câu cá — +1.2π mỗi 6h!')}
         />
 
-        {/* PLOT GRIDS */}
-        <PlotGrids plots={plots} onPlotTap={handlePlotTap} />
+        {/* PLOT GRIDS — dùng plots của bạn khi thăm, plots của mình khi ở nhà */}
+        <PlotGrids
+          plots={visitingState ? visitingState.plots : plots}
+          onPlotTap={visitingState ? handleVisitPlotTap : handlePlotTap}
+        />
 
         {/* Character */}
         <div className="absolute pointer-events-none z-50 transition-all duration-[350ms] ease-in-out"
-             style={{ left: `${charPos.x}%`, top: `${charPos.y}%` }}>
+             style={{ left: `${visitingState ? visitingState.charPos.x : charPos.x}%`,
+                      top:  `${visitingState ? visitingState.charPos.y : charPos.y}%` }}>
           <div className="relative">
-            <span className="char-anim block text-center text-3xl drop-shadow-md">🧑‍🌾</span>
-            <div className="absolute -top-1.5 -right-2 bg-yellow-400 text-amber-900 text-[7px] font-black px-1 rounded-md border border-yellow-300">Lv7</div>
+            <span className="char-anim block text-center text-3xl drop-shadow-md">
+              {visitingState ? '🧑‍🌾' : '🧑‍🌾'}
+            </span>
+            <div className="absolute -top-1.5 -right-2 bg-yellow-400 text-amber-900 text-[7px] font-black px-1 rounded-md border border-yellow-300">
+              {visitingState ? visitingState.username.slice(0,4) : 'Lv7'}
+            </div>
           </div>
           <div className="w-4 h-1.5 bg-black/18 rounded-full mx-auto blur-[2px]" />
         </div>
 
-        {/* Popup menu */}
-        {popup && (() => {
+        {/* Popup khi đang THĂM vườn — 3 action: tưới, bắt sâu, trộm */}
+        {visitingState && visitPopup && (() => {
+          const p = visitingState.plots[visitPopup.idx]
+          const canAct = p && ['growing','watered','ready'].includes(p.state)
+          const popW = 3 * 72 + 24
+          let px = visitPopup.x + 20 - popW / 2
+          px = Math.max(6, Math.min((typeof window!=='undefined'?window.innerWidth:390) - popW - 6, px))
+          return (
+            <>
+              <div className="fixed inset-0 z-[340]" onClick={() => setVisitPopup(null)} />
+              <div className="fixed z-[350] rounded-2xl overflow-hidden shadow-2xl border border-white/10"
+                   style={{ left: px, top: visitPopup.y - 10, transform: 'translateY(-100%)',
+                            background: 'rgba(18,12,6,0.92)', backdropFilter: 'blur(12px)', padding: '8px 10px' }}>
+                <div className="text-[9px] font-black text-white/50 uppercase tracking-wider mb-1.5 text-center">
+                  {p ? (STATE_LABEL[p.state] || 'Ô đất') : 'Ô đất'}
+                </div>
+                {canAct ? (
+                  <div className="flex gap-2">
+                    {[
+                      { act:'water' as const, icon:'💧', label:'Tưới nước', color:'bg-blue-600/60 border-blue-400/40' },
+                      { act:'pest'  as const, icon:'🐛', label:'Bắt sâu',   color:'bg-green-700/60 border-green-400/40' },
+                      { act:'steal' as const, icon:'🥷', label:'Ăn trộm',   color:'bg-red-700/60 border-red-400/40' },
+                    ].map(a => (
+                      <button key={a.act} onClick={() => doVisitAction(a.act, visitPopup.idx)}
+                              className={`flex flex-col items-center gap-1 px-2.5 py-2 rounded-xl min-w-[52px] border transition-all active:scale-90 ${a.color}`}>
+                        <span className="text-xl leading-none">{a.icon}</span>
+                        <span className="text-[9px] font-black text-white whitespace-nowrap">{a.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-[10px] text-white/50 text-center px-2 py-1">Ô này chưa có cây 🌿</p>
+                )}
+                <button onClick={() => setVisitPopup(null)}
+                        className="block w-full text-center text-[9px] text-white/35 font-bold mt-1.5">
+                  ✕ đóng
+                </button>
+              </div>
+            </>
+          )
+        })()}
+
+        {/* Popup menu — CHỈ hiện khi ở vườn mình */}
+        {!visitingState && popup && (() => {
           const p = plots[popup.idx]
           const popW = ALL_ACTIONS.length * 72 + 24
           let px = popup.x + 20 - popW / 2
@@ -972,7 +1047,8 @@ export default function LangPi() {
         )}
       </div>
 
-      {/* BOTTOM NAV */}
+      {/* BOTTOM NAV — ẩn khi đang thăm vườn */}
+      {!visitingState && (
       <div className="fixed bottom-0 left-0 right-0 z-[200] flex"
            style={{ background: 'linear-gradient(180deg,rgba(10,5,0,0.93),rgba(5,2,0,0.97))',
                     borderTop: '1px solid rgba(255,200,80,0.2)' }}>
@@ -995,6 +1071,7 @@ export default function LangPi() {
           </button>
         ))}
       </div>
+      )}
 
       {/* CONFIRM MODAL */}
       {confirmModal && (
@@ -1079,55 +1156,6 @@ export default function LangPi() {
                   <span>🥷 Ăn trộm — cuỗm tối đa 5% sản lượng</span>
                 </div>
               </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* VISITING OVERLAY — đang thăm vườn bạn */}
-      {visitingState && (
-        <div className="fixed inset-0 z-[680] bg-black/80 backdrop-blur-sm flex flex-col">
-          {/* Header */}
-          <div className="bg-gradient-to-br from-green-700 to-green-900 px-4 pt-10 pb-3 flex items-center gap-3">
-            <button onClick={() => setVisitingState(null)}
-                    className="text-white/70 text-sm font-black">← Về</button>
-            <div className="flex-1 text-center">
-              <div className="text-white font-black">🌾 Vườn của {visitingState.username}</div>
-              <div className="text-white/60 text-[11px]">Chọn ô để tưới, bắt sâu hoặc... trộm 😈</div>
-            </div>
-          </div>
-          {/* Plot grid */}
-          <div className="flex-1 overflow-y-auto p-4">
-            <div className="grid grid-cols-3 gap-3">
-              {visitingState.plots.map((plot, i) => {
-                const canAct = ['growing','watered','ready'].includes(plot.state)
-                return (
-                  <div key={i} className={`rounded-2xl border-2 p-3 text-center
-                    ${canAct ? 'bg-amber-800 border-amber-600' : 'bg-gray-700 border-gray-600 opacity-50'}`}>
-                    <div className="text-2xl mb-1">
-                      {plot.plant || (plot.state === 'tilled' ? '🟫' : plot.state === 'grass' ? '🌿' : '❓')}
-                    </div>
-                    <div className="text-[9px] text-white/70 mb-2">{STATE_LABEL[plot.state] || plot.state}</div>
-                    {plot.state === 'ready' && <div className="text-[9px] font-black text-green-400 mb-1">✨ Chín rồi!</div>}
-                    {canAct && (
-                      <div className="flex flex-col gap-1">
-                        <button onClick={() => doVisitAction('water', i)}
-                                className="bg-blue-500/80 text-white text-[9px] font-black py-1 rounded-lg active:scale-95">
-                          💧 Tưới
-                        </button>
-                        <button onClick={() => doVisitAction('pest', i)}
-                                className="bg-green-600/80 text-white text-[9px] font-black py-1 rounded-lg active:scale-95">
-                          🐛 Bắt sâu
-                        </button>
-                        <button onClick={() => doVisitAction('steal', i)}
-                                className="bg-red-600/80 text-white text-[9px] font-black py-1 rounded-lg active:scale-95">
-                          🥷 Trộm
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
             </div>
           </div>
         </div>
