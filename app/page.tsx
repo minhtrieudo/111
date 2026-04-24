@@ -1,5 +1,3 @@
-DIALOG REPLACED OK
-INIT REPLACED OK
 'use client'
 
 import { useState, useRef, useCallback, useEffect } from 'react'
@@ -10,7 +8,7 @@ import {
   applyVisitAction, logVisitEvent, loadUnseenVisits, markVisitsSeen,
   type FarmRow, type VisitLogRow
 } from '@/lib/supabase'
-import { authenticateWithPi, isInPiBrowser, type PiUser } from '@/lib/pi-auth'
+import { usePiAuth } from '@/contexts/pi-auth-context'
 
 // ─── TYPES ───────────────────────────────────────────────────────────
 type PlotState = 'grass' | 'tilled' | 'seeded' | 'growing' | 'watered' | 'ready' | 'buy'
@@ -306,6 +304,7 @@ export default function LangPi() {
   const [piBalance, setPi]          = useState(0)
   const [stars, setStars]           = useState(0)
   const [charPos, setCharPos]       = useState({ x: 28, y: 38 })
+  const { user: piUser } = usePiAuth()
   const [username, setUsername]     = useState('')
   const [toast, setToast]           = useState<string | null>(null)
   const [coins, setCoins]           = useState<CoinFx[]>([])
@@ -341,20 +340,13 @@ export default function LangPi() {
   // ── Initialize game — Pi SDK Authentication ──
   useEffect(() => {
     const init = async () => {
+      if (!piUser) return
       setUsername('...')
 
-      // 1. Authenticate với Pi — PiBrowser tự xử lý
-      const piUser = await authenticateWithPi()
-
-      if (!piUser) {
-        // Không lấy được Pi user — hiện màn chờ thay vì hỏi username
-        setUsername('❌')
-        return
-      }
-
-      // 2. Có Pi user
+      // Username lấy từ PiAuthContext — đã xác thực trước khi game render
       const uname = piUser.username
       setUsername(uname)
+      console.log('[Game] ✅ Logged in as:', uname)
 
       // 3. Load farm từ Supabase
       let row = await loadFarm(uname)
@@ -380,7 +372,7 @@ export default function LangPi() {
     }
 
     init()
-  }, [])
+  }, [piUser])
 
   // Tách helper load notifications
   const loadNotifications = async (uname: string) => {
@@ -442,7 +434,7 @@ export default function LangPi() {
   // ── Auto-save lên Supabase (debounce 2s) ──
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
-    if (!username || username === 'Unknown' || username === '...' || username === '❌') return
+    if (!username || username === 'Unknown' || username === '...' || username === '❌' || !piUser) return
     if (saveTimer.current) clearTimeout(saveTimer.current)
     saveTimer.current = setTimeout(async () => {
       const farm: FarmRow = {
@@ -1360,24 +1352,7 @@ export default function LangPi() {
         </DialogContent>
       </Dialog>
 
-      {/* LOADING SCREEN */}
-      {(username === '...' || username === '') && (
-        <div className="fixed inset-0 z-[900] flex flex-col items-center justify-center"
-             style={{ background: 'linear-gradient(135deg,#1a0533 0%,#2d0a5e 50%,#1a0533 100%)' }}>
-          <div style={{ fontSize:72, animation:'piFloat 2s ease-in-out infinite', marginBottom:16,
-                        filter:'drop-shadow(0 0 24px rgba(168,85,247,0.9))' }}>π</div>
-          <div className="text-white text-xl font-black mb-2" style={{ fontFamily:"'Baloo 2',cursive" }}>
-            Làng Pi
-          </div>
-          <div className="text-purple-300 text-sm mb-8">Đang kết nối Pi Network...</div>
-          <div className="flex gap-2">
-            {[0,1,2].map(i => (
-              <div key={i} className="w-2.5 h-2.5 rounded-full bg-purple-400"
-                   style={{ animation: `spark 1.2s ease-in-out ${i*0.2}s infinite` }} />
-            ))}
-          </div>
-        </div>
-      )}
+
 
       {/* LỖI KHÔNG VÀO ĐƯỢC PIBROWSER */}
       {username === '❌' && (
