@@ -351,12 +351,18 @@ export default function LangPi() {
       // 3. Load farm từ Supabase
       let row = await loadFarm(uname)
       if (!row) {
+        console.log('[v0] First time player, creating new farm...')
         row = {
           username: uname, pi_balance: 10, stars: 0,
           plots: INITIAL_PLOTS, inventory: INITIAL_INVENTORY,
           char_pos: { x: 28, y: 38 },
         }
-        await saveFarm(row)
+        try {
+          await saveFarm(row)
+          console.log('[v0] ✅ Created and saved new farm')
+        } catch (err) {
+          console.error('[v0] ❌ Failed to save new farm:', err)
+        }
       }
 
       const s = rowToState(row)
@@ -441,7 +447,12 @@ export default function LangPi() {
         username, pi_balance: piBalance, stars, plots, inventory, char_pos: charPos
       }
       saveLocalCache(farm)       // cache local ngay lập tức
-      await saveFarm(farm)       // sync lên Supabase
+      try {
+        await saveFarm(farm)       // sync lên Supabase
+        console.log('[v0] ✅ Saved farm successfully')
+      } catch (err) {
+        console.error('[v0] ❌ Failed to save farm:', err)
+      }
     }, 2000)
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current) }
   }, [plots, piBalance, stars, charPos, inventory, username])

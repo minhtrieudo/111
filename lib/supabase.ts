@@ -5,6 +5,9 @@ import { createClient } from '@supabase/supabase-js'
 const SUPABASE_URL  = process.env.NEXT_PUBLIC_SUPABASE_URL  || 'https://YOUR_PROJECT.supabase.co'
 const SUPABASE_ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'YOUR_ANON_KEY'
 
+console.log('[v0] Supabase URL:', SUPABASE_URL?.substring(0, 30) + '...')
+console.log('[v0] Supabase Key:', SUPABASE_ANON?.substring(0, 20) + '...')
+
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON)
 
 // ── Types khớp với bảng Supabase ──
@@ -38,14 +41,23 @@ export async function loadFarm(username: string): Promise<FarmRow | null> {
     .select('*')
     .eq('username', username)
     .single()
-  if (error) return null
+  
+  if (error) {
+    console.error('[v0] Supabase loadFarm error:', error)
+    return null
+  }
   return data as FarmRow
 }
 
 export async function saveFarm(farm: FarmRow): Promise<void> {
-  await supabase
+  const { error } = await supabase
     .from('farms')
     .upsert(farm, { onConflict: 'username' })
+  
+  if (error) {
+    console.error('[v0] Supabase saveFarm error:', error)
+    throw error
+  }
 }
 
 export async function loadVisitFarm(targetUsername: string): Promise<FarmRow | null> {
