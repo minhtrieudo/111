@@ -4,7 +4,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Drawer, DrawerContent, DrawerHeader, DrawerTitle } from '@/components/ui/drawer'
 import {
-  supabase, loadFarm, saveFarm, loadVisitFarm,
+  supabase, loadFarm, saveFarm, loadVisitFarm, loadFarmByUsername,
   applyVisitAction, logVisitEvent, loadUnseenVisits, markVisitsSeen,
   type FarmRow, type VisitLogRow
 } from '@/lib/supabase'
@@ -189,6 +189,7 @@ const farmToRow = (state: {
 })
 
 const rowToState = (row: FarmRow) => ({
+  pi_uid:    row.pi_uid,
   username:  row.username,
   piBalance: row.pi_balance,
   stars:     row.stars,
@@ -329,7 +330,7 @@ export default function LangPi() {
   // Social system
   const [villageModal, setVillageModal] = useState(false)
   const [visitTarget, setVisitTarget] = useState('')
-  const [visitingState, setVisitingState] = useState<{ username: string; plots: Plot[]; charPos: {x:number;y:number} } | null>(null)
+  const [visitingState, setVisitingState] = useState<{ pi_uid?: string; username: string; plots: Plot[]; charPos: {x:number;y:number} } | null>(null)
   const [visitPopup, setVisitPopup] = useState<{ idx: number; x: number; y: number } | null>(null)
   const [notifications, setNotifications] = useState<string[]>([])
   const [notifModal, setNotifModal] = useState(false)
@@ -343,26 +344,36 @@ export default function LangPi() {
       if (!piUser) return
       setUsername('...')
 
-      // Username lấy từ PiAuthContext — đã xác thực trước khi game render
+      const uid   = piUser.uid
       const uname = piUser.username
       setUsername(uname)
-      console.log('[Game] ✅ Logged in as:', uname)
+      console.log('[Game] ✅ Logged in:', uname, uid)
 
-      // 3. Load farm từ Supabase
-      let row = await loadFarm(uname)
+      // Load farm bằng pi_uid
+      let row = await loadFarm(uid)
+
       if (!row) {
-        console.log('[v0] First time player, creating new farm...')
+        // Người chơi mới — tạo farm
         row = {
-          username: uname, pi_balance: 10, stars: 0,
+          pi_uid: uid, username: uname,
+          pi_balance: 10, stars: 0,
           plots: INITIAL_PLOTS, inventory: INITIAL_INVENTORY,
           char_pos: { x: 28, y: 38 },
         }
         try {
           await saveFarm(row)
-          console.log('[v0] ✅ Created and saved new farm')
-        } catch (err) {
-          console.error('[v0] ❌ Failed to save new farm:', err)
+          console.log('[Game] ✅ Tạo farm mới thành công!')
+        } catch (err: any) {
+          console.error('[Game] ❌ Lỗi tạo farm:', err?.message || err)
+          showToast('❌ Lỗi DB: ' + (err?.message || 'unknown'))
         }
+      } else {
+        // Cập nhật username nếu đổi tên
+        if (row.username !== uname) {
+          row.username = uname
+          await saveFarm(row)
+        }
+        console.log('[Game] ✅ Load farm thành công')
       }
 
       const s = rowToState(row)
@@ -372,8 +383,8 @@ export default function LangPi() {
       saveLocalCache({ ...row, plots: resolvedPlots })
       setGameState({ username: uname, piBalance: s.piBalance, stars: s.stars, plots: resolvedPlots, charPos: s.charPos, inventory: s.inventory })
 
-      loadNotifications(uname)
-      const cleanup = setupRealtime(uname)
+      loadNotifications(uid)
+      const cleanup = setupRealtime(uid)
       return cleanup
     }
 
@@ -382,18 +393,18 @@ export default function LangPi() {
 
   // Tách helper load notifications
   const loadNotifications = async (uname: string) => {
-    const visits = await loadUnseenVisits(uname)
+    const visits = await loadUnseenVisits(piUser?.uid || uname)
     if (visits.length > 0) {
       const msgs = visits.map(ev => {
         const plantName = ev.plant ? (SEED_INFO[ev.plant]?.name || ev.plant) : 'vườn'
-        if (ev.type === 'water') return getRandomMsg(VISIT_MESSAGES.water, ev.visitor, plantName)
-        if (ev.type === 'pest')  return getRandomMsg(VISIT_MESSAGES.pest,  ev.visitor, plantName)
-        if (ev.type === 'steal') return getRandomMsg(VISIT_MESSAGES.steal, ev.visitor, plantName, ev.amount || 5)
+        if (ev.type === 'water') return getRandomMsg(VISIT_MESSAGES.water, ev.visitor_name || ev.visitor_uid, plantName)
+        if (ev.type === 'pest')  return getRandomMsg(VISIT_MESSAGES.pest,  ev.visitor_name || ev.visitor_uid, plantName)
+        if (ev.type === 'steal') return getRandomMsg(VISIT_MESSAGES.steal, ev.visitor_name || ev.visitor_uid, plantName, ev.amount || 5)
         return ''
       }).filter(Boolean)
       setNotifications(msgs)
       setNotifModal(true)
-      await markVisitsSeen(uname)
+      await markVisitsSeen(piUser?.uid || uname)
     }
   }
 
@@ -403,7 +414,7 @@ export default function LangPi() {
       .channel(`farm_${uname}`)
       .on('postgres_changes', {
         event: 'UPDATE', schema: 'public', table: 'farms',
-        filter: `username=eq.${uname}`
+        filter: `pi_uid=eq.${uname}`
       }, payload => {
         const updated = payload.new as FarmRow
         setPlots(resolveReadyPlots(updated.plots))
@@ -444,7 +455,8 @@ export default function LangPi() {
     if (saveTimer.current) clearTimeout(saveTimer.current)
     saveTimer.current = setTimeout(async () => {
       const farm: FarmRow = {
-        username, pi_balance: piBalance, stars, plots, inventory, char_pos: charPos
+        pi_uid: piUser!.uid, username,
+        pi_balance: piBalance, stars, plots, inventory, char_pos: charPos
       }
       saveLocalCache(farm)       // cache local ngay lập tức
       try {
@@ -659,9 +671,10 @@ export default function LangPi() {
     if (!targetUser.trim()) return
     if (targetUser === username) { showToast('😅 Không thể thăm vườn chính mình!'); return }
     showToast('🔍 Đang tìm vườn...')
-    const row = await loadVisitFarm(targetUser)
+    const row = await loadFarmByUsername(targetUser)
     if (!row) { showToast(`❌ Không tìm thấy vườn của "${targetUser}"`); return }
     setVisitingState({
+      pi_uid: row.pi_uid,
       username: targetUser,
       plots: row.plots as Plot[],
       charPos: row.char_pos || { x: 28, y: 38 }
@@ -684,15 +697,16 @@ export default function LangPi() {
     }
 
     const { updatedPlots, stolen } = await applyVisitAction(
-      visitingState.username, plotIdx, act, visitingState.plots
+      visitingState.pi_uid || visitingState.username, plotIdx, act, visitingState.plots
     )
     await logVisitEvent({
-      target:   visitingState.username,
-      visitor:  username,
-      type:     act,
-      plot_idx: plotIdx,
-      plant:    plot.plant || undefined,
-      amount:   act === 'steal' ? 5 : (act === 'water' ? 20 : 15),
+      target_uid:   visitingState.pi_uid || visitingState.username,
+      visitor_uid:  piUser?.uid || username,
+      visitor_name: username,
+      type:         act,
+      plot_idx:     plotIdx,
+      plant:        plot.plant || undefined,
+      amount:       act === 'steal' ? 5 : (act === 'water' ? 20 : 15),
     })
 
     if (act === 'water')      showToast(`💧 Tưới xong! ${visitingState.username} sẽ vui lắm~`)

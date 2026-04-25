@@ -21,47 +21,26 @@ declare global {
   interface Window {
     Pi: {
       init: (opts: { version: string; sandbox?: boolean }) => void
-      authenticate: (
-        scopes: string[],
-        onIncompletePayment: (p: any) => void
-      ) => Promise<{ user: { uid: string; username: string }; accessToken: string }>
+      authenticate: (scopes: string[], onIncomplete: (p: any) => void) => Promise<{ user: { uid: string; username: string }; accessToken: string }>
+    }
+    SDKLite: {
+      init: () => Promise<{ login: () => Promise<boolean>; state: any }>
     }
   }
 }
 
-// Bước 1: Load file SDK về
-const loadPiSDK = (): Promise<void> =>
-  new Promise((resolve, reject) => {
-    if (typeof window.Pi !== 'undefined') { resolve(); return }
-    const existing = document.querySelector('script[src*="minepi.com"]')
-    if (existing) {
-      // Script đã có nhưng chưa load xong — chờ
-      existing.addEventListener('load', () => resolve())
-      existing.addEventListener('error', () => reject(new Error('SDK load failed')))
-      return
-    }
-    const script = document.createElement('script')
-    script.src = 'https://sdk.minepi.com/pi-sdk.js'
-    script.onload = () => resolve()
-    script.onerror = () => reject(new Error('Không tải được Pi SDK'))
-    document.head.appendChild(script)
+function loadScript(url: string, timeout = 10000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${url}"]`)) { resolve(); return }
+    const s = document.createElement('script')
+    s.src = url
+    s.async = true
+    const t = setTimeout(() => reject(new Error(`Timeout: ${url}`)), timeout)
+    s.onload = () => { clearTimeout(t); resolve() }
+    s.onerror = () => { clearTimeout(t); reject(new Error(`Failed: ${url}`)) }
+    document.head.appendChild(s)
   })
-
-// Bước 2: Chờ window.Pi thực sự sẵn sàng sau khi script load
-const waitForPiObject = (timeoutMs = 10000): Promise<void> =>
-  new Promise((resolve, reject) => {
-    if (typeof window.Pi !== 'undefined') { resolve(); return }
-    const start = Date.now()
-    const check = setInterval(() => {
-      if (typeof window.Pi !== 'undefined') {
-        clearInterval(check)
-        resolve()
-      } else if (Date.now() - start > timeoutMs) {
-        clearInterval(check)
-        reject(new Error('Pi SDK timeout — window.Pi không xuất hiện'))
-      }
-    }, 100)
-  })
+}
 
 export function PiAuthProvider({ children }: { children: ReactNode }) {
   const [isAuthenticated, setIsAuthenticated] = useState(false)
@@ -75,52 +54,56 @@ export function PiAuthProvider({ children }: { children: ReactNode }) {
     setUser(null)
 
     try {
-      // Bước 1: Load SDK
       setAuthMessage('Đang tải Pi SDK...')
-      await loadPiSDK()
 
-      // Bước 2: Chờ window.Pi sẵn sàng
-      setAuthMessage('Đang chuẩn bị...')
-      await waitForPiObject()
+      // Load cả 2 SDK song song
+      await Promise.all([
+        loadScript('https://sdk.minepi.com/pi-sdk.js'),
+        loadScript('https://pi-apps.github.io/pi-sdk-lite/build/production/sdklite.js'),
+      ])
 
-      // Bước 3: Init — PHẢI xong trước khi authenticate
-      setAuthMessage('Đang khởi động Pi SDK...')
-      window.Pi.init({ version: '2.0', sandbox: false })
+      setAuthMessage('Đang khởi động...')
+      await window.Pi.init({ version: '2.0', sandbox: false })
 
-      // Bước 4: Chờ thêm 300ms để init settle (quan trọng!)
-      await new Promise(resolve => setTimeout(resolve, 300))
+      // Chờ 300ms để init settle
+      await new Promise(r => setTimeout(r, 300))
 
-      // Bước 5: Authenticate
-      setAuthMessage('Đang xác thực tài khoản Pi...')
-      const auth = await window.Pi.authenticate(
-        ['username'],
-        (payment: any) => {
-          console.warn('[PiAuth] Incomplete payment:', payment)
-        }
-      )
+      setAuthMessage('Đang xác thực...')
 
-      if (!auth?.user) throw new Error('Không nhận được thông tin user từ Pi')
+      // Chạy song song: SDK Lite login + Pi authenticate
+      const [sdkInstance, authResult] = await Promise.all([
+        window.SDKLite.init(),
+        window.Pi.authenticate(
+          ['username'],
+          (payment: any) => console.warn('[PiAuth] Incomplete payment:', payment)
+        ).catch(() => null),
+      ])
 
-      setUser({ uid: auth.user.uid, username: auth.user.username })
+      const loginOk = await sdkInstance.login()
+      if (!loginOk) throw new Error('SDK Lite login thất bại')
+      if (!authResult?.user) throw new Error('Pi không trả về user data')
+
+      const piUser: PiUser = {
+        uid: authResult.user.uid,
+        username: authResult.user.username,
+      }
+
+      setUser(piUser)
       setIsAuthenticated(true)
       setAuthMessage('Xác thực thành công!')
-      console.log('[PiAuth] ✅ Logged in:', auth.user.username)
+      console.log('[PiAuth] ✅ Logged in:', piUser.username, piUser.uid)
 
     } catch (err) {
       console.error('[PiAuth] ❌', err)
       setHasError(true)
-      setAuthMessage(
-        err instanceof Error ? err.message : 'Xác thực thất bại — thử lại'
-      )
+      setAuthMessage(err instanceof Error ? err.message : 'Xác thực thất bại')
     }
   }
 
   useEffect(() => { initialize() }, [])
 
   return (
-    <PiAuthContext.Provider
-      value={{ isAuthenticated, user, authMessage, hasError, reinitialize: initialize }}
-    >
+    <PiAuthContext.Provider value={{ isAuthenticated, user, authMessage, hasError, reinitialize: initialize }}>
       {children}
     </PiAuthContext.Provider>
   )
