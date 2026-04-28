@@ -4,299 +4,23 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Drawer, DrawerContent, DrawerHeader, DrawerTitle } from '@/components/ui/drawer'
 import {
-  supabase, loadFarm, saveFarm, loadVisitFarm, loadFarmByUsername,
+  supabase, loadFarm, saveFarm, loadFarmByUsername,
   applyVisitAction, logVisitEvent, loadUnseenVisits, markVisitsSeen,
   type FarmRow, type VisitLogRow
 } from '@/lib/supabase'
 import { usePiAuth } from '@/contexts/pi-auth-context'
-
-// ─── TYPES ───────────────────────────────────────────────────────────
-type PlotState = 'grass' | 'tilled' | 'seeded' | 'growing' | 'watered' | 'ready' | 'buy'
-
-interface Plot {
-  state: PlotState
-  plant: string | null
-  progress: number
-  reward: number
-  timer: string
-  price?: number
-  plantedAt?: number // Timestamp khi gieo (milliseconds)
-  growTime?: number // Thời gian lớn (milliseconds)
-}
-
-interface SeedOption {
-  emoji: string
-  name: string
-  time: string
-  reward: number
-}
-
-interface GameState {
-  username: string
-  piBalance: number
-  stars: number
-  plots: Plot[]
-  charPos: { x: number; y: number }
-  inventory: Record<string, number> // { '🥬': 12, '🍅': 0, ... }
-}
-
-// ─── CONSTANTS ───────────────────────────────────────────────────────
-const SEEDS: SeedOption[] = [
-  { emoji: '🥬', name: 'Rau cải',  time: '2h',  reward: 0.15 },
-  { emoji: '🍅', name: 'Cà chua',  time: '4h',  reward: 0.35 },
-  { emoji: '🌽', name: 'Bắp ngô',  time: '6h',  reward: 0.55 },
-  { emoji: '🥕', name: 'Cà rốt',   time: '8h',  reward: 0.70 },
-  { emoji: '🎃', name: 'Bí ngô',   time: '12h', reward: 1.20 },
-]
-
-const STATE_LABEL: Record<string, string> = {
-  grass: 'Đất trống', tilled: 'Đã làm đất',
-  seeded: 'Đã gieo hạt', growing: 'Đang lớn',
-  watered: 'Đã tưới', ready: 'Thu hoạch',
-}
-
-// ─── TIME HELPERS ──────────────────────────────────────────────────
-const timeStringToMs = (timeStr: string): number => {
-  const match = timeStr.match(/(\d+)([hm])/)
-  if (!match) return 0
-  const value = parseInt(match[1])
-  const unit = match[2]
-  if (unit === 'h') return value * 60 * 60 * 1000
-  return value * 60 * 1000
-}
-
-const msToTimeString = (ms: number): string => {
-  const totalSeconds = Math.floor(ms / 1000)
-  const hours = Math.floor(totalSeconds / 3600)
-  const minutes = Math.floor((totalSeconds % 3600) / 60)
-  
-  if (hours > 0) {
-    return minutes > 0 ? `${hours}h${minutes}` : `${hours}h`
-  }
-  return `${minutes}m`
-}
-
-const INITIAL_PLOTS: Plot[] = [
-  { state:'grass',   plant:null, progress:0,   reward:0,    timer:'' },
-  { state:'grass',   plant:null, progress:0,   reward:0,    timer:'' },
-  { state:'grass',   plant:null, progress:0,   reward:0,    timer:'' },
-  { state:'grass',   plant:null, progress:0,   reward:0,    timer:'' },
-  { state:'grass',   plant:null, progress:0,   reward:0,    timer:'' },
-  { state:'grass',   plant:null, progress:0,   reward:0,    timer:'' },
-]
-
-const INITIAL_INVENTORY: Record<string, number> = {
-  '🥬': 5, // 5 hạt rau cải để bắt đầu
-}
-
-// Mapping emoji hạt → thông tin seed
-const SEED_INFO: Record<string, SeedOption> = {
-  '🌹': { emoji:'🌹', name:'Hoa hồng',  time:'6h',  reward:0.80 },
-  '🌷': { emoji:'🌷', name:'Hoa tulip', time:'8h',  reward:1.00 },
-  '🌾': { emoji:'🌾', name:'Lúa',       time:'4h',  reward:0.45 },
-  '🌽': { emoji:'🌽', name:'Ngô',       time:'6h',  reward:0.55 },
-  '🎃': { emoji:'🎃', name:'Bí ngô',    time:'12h', reward:1.20 },
-  '🥬': { emoji:'🥬', name:'Rau cải',   time:'2h',  reward:0.15 },
-  '🍅': { emoji:'🍅', name:'Cà chua',   time:'4h',  reward:0.35 },
-  '🥕': { emoji:'🥕', name:'Cà rốt',    time:'8h',  reward:0.70 },
-}
-
-// Các giai đoạn phát triển theo % progress
-// [0-15]: hạt mầm, [15-35]: mọc mầm, [35-60]: cây non, [60-80]: ra hoa/kết trái, [80-100]: chín
-const GROWTH_STAGES: Record<string, string[]> = {
-  // emoji: [hạt mầm, mọc mầm, cây non, ra hoa/kết trái, chín/thu hoạch]
-  '🥬': ['🌰', '🌱', '🪴', '🥬', '🥬'],
-  '🍅': ['🌰', '🌱', '🌿', '🍅', '🍅'],
-  '🌽': ['🌰', '🌱', '🌿', '🌽', '🌽'],
-  '🥕': ['🌰', '🌱', '🌿', '🥕', '🥕'],
-  '🎃': ['🌰', '🌱', '🌿', '🎃', '🎃'],
-  '🌹': ['🌰', '🌱', '🌿', '🌸', '🌹'],
-  '🌷': ['🌰', '🌱', '🌿', '🌸', '🌷'],
-  '🌾': ['🌰', '🌱', '🌿', '🌾', '🌾'],
-}
-
-// Nhãn giai đoạn
-const STAGE_LABELS = ['Hạt mầm', 'Mọc mầm', 'Cây non', 'Ra hoa', 'Chín']
-
-// Lấy emoji và size theo progress
-function getPlantVisual(plant: string, progress: number): { emoji: string; size: string; label: string } {
-  const stages = GROWTH_STAGES[plant] || ['🌰','🌱','🌿', plant, plant]
-  let stageIdx: number
-  if (progress < 15)      stageIdx = 0
-  else if (progress < 35) stageIdx = 1
-  else if (progress < 60) stageIdx = 2
-  else if (progress < 85) stageIdx = 3
-  else                     stageIdx = 4
-
-  const sizeMap = ['text-sm', 'text-base', 'text-lg', 'text-xl', 'text-2xl']
-  return {
-    emoji: stages[stageIdx],
-    size: sizeMap[stageIdx],
-    label: STAGE_LABELS[stageIdx],
-  }
-}
-
-// ─── SOCIAL SYSTEM ────────────────────────────────────────────────────
-const getRandomMsg = (arr: ((...a: any[]) => string)[], ...args: any[]) =>
-  arr[Math.floor(Math.random() * arr.length)](...args)
-
-const VISIT_MESSAGES = {
-  water: [
-    (v: string, p: string) => `💧 ${v} đã ghé vườn và tưới cây ${p} cho bạn! Ấm lòng ghê~`,
-    (v: string, p: string) => `🌊 Ôi trời! ${v} tốt bụng quá, tưới cả ${p} cho mình luôn 🥹`,
-    (v: string, p: string) => `💦 ${v} vừa tưới ${p} — bạn bè kiểu này mới gọi là real friend!`,
-  ],
-  pest: [
-    (v: string, p: string) => `🐛 ${v} đã bắt sâu cho ${p} của bạn! Anh hùng thầm lặng 🦸`,
-    (v: string, p: string) => `🪲 Nhờ ${v} bắt sâu, ${p} nhà bạn sạch bóng! Cảm ơn chiến hữu~`,
-    (v: string, p: string) => `🐜 ${v} tay không bắt giặc (sâu), cứu ${p} khỏi nguy hiểm 😤`,
-  ],
-  steal: [
-    (v: string, p: string, a: number) => `🥷 Ối dời! ${v} lén lút cuỗm mất ${a}% ${p} của bạn! Mặt dày thật sự 😤`,
-    (v: string, p: string, a: number) => `😱 ${v} đã trộm ${a}% ${p}! Hàng xóm kiểu này thì... thôi kệ 🫠`,
-    (v: string, p: string, a: number) => `🤡 ${v} nghĩ mình trộm giỏi lắm, lấy ${a}% ${p} của bạn đấy! Ghi tên lại nhé~`,
-  ],
-}
-
-// ─── STORAGE HELPERS (Supabase) ───────────────────────────────────────
+import { PlotCell } from '@/components/PlotCell'
+import { RoadFlowers, ZonesAndBuildings, PlotGrids } from '@/components/WorldScene'
+import {
+  type PlotState, type Plot, type SeedOption, type GameState, type Fish, type Chicken,
+  SEEDS, STATE_LABEL, SEED_INFO, GROWTH_STAGES, STAGE_LABELS,
+  INITIAL_PLOTS, INITIAL_INVENTORY,
+  FISH_GROW_MS, CHICKEN_MATURE_MS, EGG_INTERVAL_MS, FISH_SELL_REWARD, EGG_SELL_REWARD,
+  timeStringToMs, msToTimeString, getPlantVisual, getRandomMsg, VISIT_MESSAGES,
+} from '@/lib/game-types'
+import { saveLocalCache, loadLocalCache, rowToState, resolveReadyPlots } from '@/lib/game-storage'
 
 
-// ─── STORAGE HELPERS (Supabase + Pi Auth) ─────────────────────────────────
-// Cache local để không mất data khi mạng chậm
-const LOCAL_KEY = 'lang_pi_game_state'
-
-const saveLocalCache = (farm: FarmRow) => {
-  try { localStorage.setItem(LOCAL_KEY, JSON.stringify(farm)) } catch {}
-}
-
-const loadLocalCache = (): FarmRow | null => {
-  try {
-    const d = localStorage.getItem(LOCAL_KEY)
-    return d ? JSON.parse(d) : null
-  } catch { return null }
-}
-
-const farmToRow = (state: {
-  username: string; piBalance: number; stars: number;
-  plots: Plot[]; inventory: Record<string,number>; charPos: {x:number;y:number}
-}): FarmRow => ({
-  username:   state.username,
-  pi_balance: state.piBalance,
-  stars:      state.stars,
-  plots:      state.plots,
-  inventory:  state.inventory,
-  char_pos:   state.charPos,
-})
-
-const rowToState = (row: FarmRow) => ({
-  pi_uid:    row.pi_uid,
-  username:  row.username,
-  piBalance: row.pi_balance,
-  stars:     row.stars,
-  plots:     (row.plots || INITIAL_PLOTS) as Plot[],
-  inventory: row.inventory || INITIAL_INVENTORY,
-  charPos:   row.char_pos  || { x: 28, y: 38 },
-})
-
-// ─── PLOT COMPONENT ───────────────────────────────────────────────────
-function PlotCell({ plot, onClick }: { plot: Plot; onClick: (e: React.MouseEvent) => void }) {
-  const bgMap: Record<string, string> = {
-    grass: 'bg-amber-700 border-amber-900',
-    tilled: 'bg-amber-900 border-amber-950',
-    seeded: 'bg-amber-800 border-amber-900',
-    growing: 'bg-amber-800 border-amber-900',
-    watered: 'bg-amber-950 border-stone-900',
-    ready: 'bg-green-700 border-green-900 shadow-[0_0_12px_rgba(74,222,128,0.5)]',
-    buy: 'bg-green-600/40 border-dashed border-green-500',
-  }
-
-  // Lấy visual theo giai đoạn phát triển
-  const visual = plot.plant && plot.state !== 'buy' && plot.state !== 'ready'
-    ? getPlantVisual(plot.plant, plot.progress)
-    : null
-
-  return (
-    <button
-      onClick={onClick}
-      className={`relative rounded-md border-2 aspect-square flex flex-col items-center justify-center 
-        transition-all duration-100 active:scale-90 overflow-visible
-        ${bgMap[plot.state] || bgMap.grass}
-        ${plot.state === 'ready' ? 'animate-pulse' : ''}
-      `}
-      style={{
-        backgroundImage: plot.state !== 'buy'
-          ? 'repeating-linear-gradient(90deg,transparent 0,transparent 9px,rgba(0,0,0,0.07) 9px,rgba(0,0,0,0.07) 10px)'
-          : undefined,
-      }}
-    >
-      {/* Buy slot */}
-      {plot.state === 'buy' && (
-        <div className="flex flex-col items-center gap-0.5">
-          <span className="text-lg">🔓</span>
-          <span className="text-[9px] font-black text-green-800 bg-white/60 px-1 rounded">+{plot.price}π</span>
-        </div>
-      )}
-
-      {/* Cây đã chín — hiện emoji gốc to */}
-      {plot.state === 'ready' && plot.plant && (
-        <span className="text-2xl drop-shadow-md animate-[plantBob_2.5s_ease-in-out_infinite]">
-          {plot.plant}
-        </span>
-      )}
-
-      {/* Cây đang lớn — hiện theo giai đoạn */}
-      {visual && (
-        <div className="flex flex-col items-center gap-0.5">
-          <span className={`${visual.size} drop-shadow-md animate-[plantBob_2.5s_ease-in-out_infinite] transition-all duration-1000`}>
-            {visual.emoji}
-          </span>
-          <span className="text-[7px] font-black text-white/70 leading-none">{visual.label}</span>
-        </div>
-      )}
-
-      {/* Tilled empty hint */}
-      {plot.state === 'tilled' && (
-        <span className="text-xl opacity-30">🌱</span>
-      )}
-
-      {/* Water shine */}
-      {plot.state === 'watered' && (
-        <span className="absolute top-1 right-1 text-[9px]">💧</span>
-      )}
-
-      {/* Progress bar */}
-      {(plot.state === 'growing' || plot.state === 'watered') && (
-        <div className="absolute bottom-1 left-1.5 right-1.5 h-1 bg-black/20 rounded-full overflow-hidden">
-          <div
-            className="h-full bg-gradient-to-r from-lime-300 to-green-400 rounded-full transition-all"
-            style={{ width: `${plot.progress}%` }}
-          />
-        </div>
-      )}
-
-      {/* Ready badge */}
-      {plot.state === 'ready' && (
-        <div className="absolute -top-5 left-1/2 -translate-x-1/2 whitespace-nowrap
-          bg-green-600 text-white text-[7px] font-black px-1.5 py-0.5 rounded-full
-          shadow-md animate-bounce z-10">
-          ✨ Thu hoạch!
-          <div className="text-center text-[6px] leading-none">▼</div>
-        </div>
-      )}
-
-      {/* Timer */}
-      {(plot.state === 'growing' || plot.state === 'watered') && plot.timer && (
-        <div className="absolute -top-4 left-1/2 -translate-x-1/2 whitespace-nowrap
-          bg-black/60 text-white text-[7px] font-black px-1 py-0.5 rounded z-10">
-          ⏱{plot.timer}
-        </div>
-      )}
-    </button>
-  )
-}
-
-// ─── COIN FX ─────────────────────────────────────────────────────────
-interface CoinFx { id: number; x: number; y: number; text: string }
 
 // ─── MAIN GAME ────────────────────────────────────────────────────────
 export default function LangPi() {
@@ -305,6 +29,13 @@ export default function LangPi() {
   const [piBalance, setPi]          = useState(0)
   const [stars, setStars]           = useState(0)
   const [charPos, setCharPos]       = useState({ x: 28, y: 38 })
+  const [isWalking, setIsWalking]   = useState(false)
+  const [walkFrame, setWalkFrame]   = useState(0)
+  const [facingLeft, setFacingLeft] = useState(false)
+  const [gender, setGender]         = useState<'male'|'female'|null>(null)
+  const [showGenderPick, setShowGenderPick] = useState(false)
+  const walkTimer = useRef<ReturnType<typeof setInterval> | null>(null)
+  const stopTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const { user: piUser } = usePiAuth()
   const [username, setUsername]     = useState('')
   const [toast, setToast]           = useState<string | null>(null)
@@ -318,7 +49,7 @@ export default function LangPi() {
   const [seedModal, setSeedModal]   = useState(false)
   const [invModal, setInvModal]     = useState(false)
   const [shopModal, setShopModal]   = useState(false)
-  const [shopTab, setShopTab]       = useState<'seeds'|'fert'|'land'>('seeds')
+  const [shopTab, setShopTab]       = useState<'seeds'|'fert'|'land'|'animals'>('seeds')
   const [selectedSeed, setSelectedSeed] = useState<SeedOption>(SEEDS[0])
   const [pendingPlot, setPendingPlot]   = useState<number | null>(null)
 
@@ -334,22 +65,62 @@ export default function LangPi() {
   const [visitPopup, setVisitPopup] = useState<{ idx: number; x: number; y: number } | null>(null)
   const [notifications, setNotifications] = useState<string[]>([])
   const [notifModal, setNotifModal] = useState(false)
+  const [fish, setFish]           = useState<Fish[]>([])
+  const [chickens, setChickens]   = useState<Chicken[]>([])
+  const [fishModal, setFishModal] = useState(false)
+  const [henModal, setHenModal]   = useState(false)
+  const fishId = useRef(0)
+  const chickenId = useRef(0)
 
   const worldRef = useRef<HTMLDivElement>(null)
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // ── Load cache ngay lập tức khi app mở (không chờ piUser) ──
+  useEffect(() => {
+    const cache = loadLocalCache()
+    if (cache) {
+      const s = rowToState(cache)
+      const resolvedPlots = resolveReadyPlots(s.plots)
+      setPlots(resolvedPlots)
+      setPi(s.piBalance)
+      setStars(s.stars)
+      setCharPos(s.charPos)
+      setInventory(s.inventory)
+      if (s.fish)     setFish(s.fish)
+      if (s.chickens) setChickens(s.chickens)
+      if (s.username) setUsername(s.username)
+    }
+  }, [])
+
+  // ── Save ngay khi user thoát app (không chờ debounce) ──
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden' && piUser && username &&
+          username !== '...' && username !== '❌') {
+        const farm: any = {
+          pi_uid: piUser.uid, username,
+          pi_balance: piBalance, stars, plots, inventory, char_pos: charPos,
+          fish, chickens, gender,
+        }
+        saveLocalCache(farm)
+        saveFarm(farm).catch(() => {})
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
+  }, [plots, piBalance, stars, charPos, inventory, fish, chickens, username, piUser])
 
   // ── Initialize game — Pi SDK Authentication ──
   useEffect(() => {
     const init = async () => {
       if (!piUser) return
-      setUsername('...')
 
       const uid   = piUser.uid
       const uname = piUser.username
       setUsername(uname)
       console.log('[Game] ✅ Logged in:', uname, uid)
 
-      // Load farm bằng pi_uid
+      // Load farm từ Supabase
       let row = await loadFarm(uid)
 
       if (!row) {
@@ -368,7 +139,6 @@ export default function LangPi() {
           showToast('❌ Lỗi DB: ' + (err?.message || 'unknown'))
         }
       } else {
-        // Cập nhật username nếu đổi tên
         if (row.username !== uname) {
           row.username = uname
           await saveFarm(row)
@@ -380,6 +150,16 @@ export default function LangPi() {
       const resolvedPlots = resolveReadyPlots(s.plots)
       setPlots(resolvedPlots); setPi(s.piBalance); setStars(s.stars)
       setCharPos(s.charPos); setInventory(s.inventory)
+      // Load cá và gà từ inventory đặc biệt
+      if ((s.inventory as any)['__fish__']) setFish((s.inventory as any)['__fish__'])
+      if ((s.inventory as any)['__chickens__']) setChickens((s.inventory as any)['__chickens__'])
+      // Load gender từ farm
+      const savedGender = (row as any).gender
+      if (savedGender === 'male' || savedGender === 'female') {
+        setGender(savedGender)
+      } else {
+        setShowGenderPick(true)
+      }
       saveLocalCache({ ...row, plots: resolvedPlots })
       setGameState({ username: uname, piBalance: s.piBalance, stars: s.stars, plots: resolvedPlots, charPos: s.charPos, inventory: s.inventory })
 
@@ -448,26 +228,24 @@ export default function LangPi() {
     return plot
   })
 
-  // ── Auto-save lên Supabase (debounce 2s) ──
+  // ── Auto-save lên Supabase (debounce 800ms) ──
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
     if (!username || username === 'Unknown' || username === '...' || username === '❌' || !piUser) return
     if (saveTimer.current) clearTimeout(saveTimer.current)
     saveTimer.current = setTimeout(async () => {
-      const farm: FarmRow = {
+      const farm: any = {
         pi_uid: piUser!.uid, username,
-        pi_balance: piBalance, stars, plots, inventory, char_pos: charPos
+        pi_balance: piBalance, stars, plots, inventory, char_pos: charPos,
+        fish, chickens,
       }
-      saveLocalCache(farm)       // cache local ngay lập tức
-      try {
-        await saveFarm(farm)       // sync lên Supabase
-        console.log('[v0] ✅ Saved farm successfully')
-      } catch (err) {
+      saveLocalCache(farm)
+      try { await saveFarm(farm) } catch (err) {
         console.error('[v0] ❌ Failed to save farm:', err)
       }
-    }, 2000)
+    }, 800)
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current) }
-  }, [plots, piBalance, stars, charPos, inventory, username])
+  }, [plots, piBalance, stars, charPos, inventory, fish, chickens, username])
 
   // ── Timer update every second ──
   useEffect(() => {
@@ -494,6 +272,25 @@ export default function LangPi() {
       })
     }, 1000)
 
+    return () => clearInterval(interval)
+  }, [])
+
+  // ── Timer gà đẻ trứng (mỗi phút) ──
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = Date.now()
+      const FED_WINDOW = 8 * 60 * 60 * 1000
+      setChickens(cs => cs.map(c => {
+        if (now < c.matureAt) return c // chưa trưởng thành
+        // Không cho ăn → đẻ chậm 2x
+        const effectiveInterval = (now - c.fedAt) > FED_WINDOW
+          ? EGG_INTERVAL_MS * 2 : EGG_INTERVAL_MS
+        const elapsed = now - c.lastEggAt
+        const newEggs = Math.floor(elapsed / effectiveInterval)
+        if (newEggs <= 0) return c
+        return { ...c, eggs: c.eggs + newEggs, lastEggAt: c.lastEggAt + newEggs * effectiveInterval }
+      }))
+    }, 60000)
     return () => clearInterval(interval)
   }, [])
 
@@ -729,6 +526,104 @@ export default function LangPi() {
     showToast(`🎉 Mở ô đất mới! -${price}π`)
   }, [piBalance, plots.length, showToast])
 
+  // ── Thả cá vào ao ──
+  const addFish = useCallback(() => {
+    if (fish.length >= 5) { showToast('❌ Ao đầy rồi! Tối đa 5 con'); return }
+    const fishInInv = inventory['🐟'] || 0
+    if (fishInInv < 1) { showToast('❌ Không có cá con! Mua ở cửa hàng'); return }
+    const now = Date.now()
+    const newFish: Fish = {
+      id: ++fishId.current,
+      placedAt: now, fedAt: now,
+      readyAt: now + FISH_GROW_MS,
+      name: '🐟',
+    }
+    setFish(f => [...f, newFish])
+    setInventory(inv => {
+      const n = (inv['🐟'] || 0) - 1
+      return n <= 0 ? (({ '🐟': _, ...rest }) => rest)(inv) : { ...inv, '🐟': n }
+    })
+    showToast('🐟 Đã thả cá vào ao!')
+  }, [fish, inventory, showToast])
+
+  // ── Thả gà vào tổ ──
+  const addChicken = useCallback(() => {
+    if (chickens.length >= 5) { showToast('❌ Tổ đầy rồi! Tối đa 5 con'); return }
+    const chkInInv = inventory['🐣'] || 0
+    if (chkInInv < 1) { showToast('❌ Không có gà con! Mua ở cửa hàng'); return }
+    const now = Date.now()
+    const newChicken: Chicken = {
+      id: ++chickenId.current,
+      placedAt: now, fedAt: now,
+      matureAt: now + CHICKEN_MATURE_MS,
+      lastEggAt: now + CHICKEN_MATURE_MS,
+      eggs: 0,
+    }
+    setChickens(c => [...c, newChicken])
+    setInventory(inv => {
+      const n = (inv['🐣'] || 0) - 1
+      return n <= 0 ? (({ '🐣': _, ...rest }) => rest)(inv) : { ...inv, '🐣': n }
+    })
+    showToast('🐣 Đã thả gà vào tổ!')
+  }, [chickens, inventory, showToast])
+
+  // ── Cho cá ăn ──
+  const feedFish = useCallback((id: number) => {
+    const food = inventory['🌾'] || 0
+    if (food < 1) { showToast('❌ Hết thức ăn! Mua thêm ở cửa hàng'); return }
+    setFish(fs => fs.map(f => f.id === id ? { ...f, fedAt: Date.now() } : f))
+    setInventory(inv => {
+      const n = (inv['🌾'] || 0) - 1
+      return n <= 0 ? (({ '🌾': _, ...rest }) => rest)(inv) : { ...inv, '🌾': n }
+    })
+    showToast('🌾 Cho cá ăn rồi! +tốc độ lớn')
+  }, [inventory, showToast])
+
+  // ── Cho gà ăn ──
+  const feedChicken = useCallback((id: number) => {
+    const food = inventory['🌾'] || 0
+    if (food < 1) { showToast('❌ Hết thức ăn! Mua thêm ở cửa hàng'); return }
+    setChickens(cs => cs.map(c => c.id === id ? { ...c, fedAt: Date.now() } : c))
+    setInventory(inv => {
+      const n = (inv['🌾'] || 0) - 1
+      return n <= 0 ? (({ '🌾': _, ...rest }) => rest)(inv) : { ...inv, '🌾': n }
+    })
+    showToast('🌾 Cho gà ăn rồi! +trứng')
+  }, [inventory, showToast])
+
+  // ── Thu trứng ──
+  const collectEggs = useCallback((id: number) => {
+    const chicken = chickens.find(c => c.id === id)
+    if (!chicken || chicken.eggs <= 0) { showToast('🥚 Chưa có trứng!'); return }
+    const reward = Math.round(chicken.eggs * EGG_SELL_REWARD * 100) / 100
+    spawnCoin(window.innerWidth / 2, window.innerHeight / 2, `+${reward}π`)
+    setPi(b => Math.round((b + reward) * 100) / 100)
+    setChickens(cs => cs.map(c => c.id === id ? { ...c, eggs: 0 } : c))
+    showToast(`🥚 Thu ${chicken.eggs} trứng! +${reward}π`)
+  }, [chickens, spawnCoin, showToast])
+
+  // ── Bán cá ──
+  const sellFish = useCallback((id: number) => {
+    const f = fish.find(x => x.id === id)
+    if (!f) return
+    const now = Date.now()
+    // Kiểm tra đủ lớn chưa
+    if (now < f.readyAt) {
+      const rem = msToTimeString(f.readyAt - now)
+      showToast(`⏱ Còn ${rem} nữa mới bán được!`); return
+    }
+    // Tính thưởng — không cho ăn đủ thì giảm
+    const FED_WINDOW = 8 * 60 * 60 * 1000 // 8 tiếng
+    const timeSinceFed = now - f.fedAt
+    const fedMultiplier = timeSinceFed > FED_WINDOW ? 0.5 : 1.0
+    const reward = Math.round(FISH_SELL_REWARD * fedMultiplier * 100) / 100
+    spawnCoin(window.innerWidth / 2, window.innerHeight / 2, `+${reward}π`)
+    setPi(b => Math.round((b + reward) * 100) / 100)
+    setFish(fs => fs.filter(x => x.id !== id))
+    if (fedMultiplier < 1) showToast(`🐟 Bán cá được ${reward}π (ít vì không cho ăn đủ 😔)`)
+    else showToast(`🐟 Bán cá được ${reward}π! Ngon!`)
+  }, [fish, spawnCoin, showToast])
+
   // ── tap world to move char ──
   const handleWorldTap = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const el = e.target as HTMLElement
@@ -736,7 +631,30 @@ export default function LangPi() {
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
     const px = ((e.clientX - rect.left) / rect.width) * 100
     const py = ((e.clientY - rect.top) / rect.height) * 100
-    setCharPos({ x: Math.max(2, Math.min(px - 2, 90)), y: Math.max(22, Math.min(py - 4, 85)) })
+    const newX = Math.max(2, Math.min(px - 2, 90))
+    const newY = Math.max(22, Math.min(py - 4, 85))
+
+    // Xác định hướng nhìn
+    setCharPos(prev => {
+      setFacingLeft(newX < prev.x)
+      return { x: newX, y: newY }
+    })
+
+    // Bắt đầu animation đi bộ
+    setIsWalking(true)
+    if (walkTimer.current) clearInterval(walkTimer.current)
+    if (stopTimer.current) clearTimeout(stopTimer.current)
+
+    walkTimer.current = setInterval(() => {
+      setWalkFrame(f => (f + 1) % 3)
+    }, 280)
+
+    // Dừng sau khi đến nơi
+    stopTimer.current = setTimeout(() => {
+      setIsWalking(false)
+      setWalkFrame(0)
+      if (walkTimer.current) clearInterval(walkTimer.current)
+    }, 650)
   }, [])
 
   // Luôn hiện 4 công cụ
@@ -764,13 +682,14 @@ export default function LangPi() {
         @keyframes leafSway { 0%,100%{transform:rotate(-4deg)} 50%{transform:rotate(4deg) translateY(-1px)} }
         @keyframes coinUp { 0%{transform:translateY(0) scale(1.2);opacity:1} 100%{transform:translateY(-65px) scale(0.4);opacity:0} }
         @keyframes charBob { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-3px)} }
+        @keyframes breathe { 0%,100%{transform:scaleY(1) scaleX(1)} 40%{transform:scaleY(1.03) scaleX(0.98)} 70%{transform:scaleY(0.98) scaleX(1.01)} }
         @keyframes piGlow { 0%,100%{opacity:0.55} 50%{opacity:1} }
         @keyframes piFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
         @keyframes arrBob { 0%,100%{transform:translateX(-50%) translateY(0)} 50%{transform:translateX(-50%) translateY(3px)} }
         @keyframes smoke { 0%{transform:translateY(0) scale(0.5);opacity:0.9} 100%{transform:translateY(-20px) scale(1.4);opacity:0} }
         @keyframes smokeMain { 0%{transform:translateY(0) scale(0.5);opacity:0.9} 100%{transform:translateY(-20px) scale(1.4);opacity:0} }
         @keyframes badgeBob { 0%,100%{transform:translateX(-50%) translateY(0)} 50%{transform:translateX(-50%) translateY(-3px)} }
-        .char-anim { animation: charBob 1.6s ease-in-out infinite; }
+        .char-anim { animation: breathe 1.6s ease-in-out infinite; }
         .arr-anim { animation: arrBob 1s ease-in-out infinite; }
         .tree-sway { animation: treeSway 4s ease-in-out infinite; }
         .cloud-drift-1 { animation: cloudDrift 28s linear infinite; }
@@ -905,9 +824,11 @@ export default function LangPi() {
         {/* Dividers & Zones */}
         <ZonesAndBuildings
           piBalance={piBalance}
+          fish={fish}
           onKitchen={() => showToast('🍳 Nhà bếp — chế biến nông sản!')}
           onWarehouse={() => setInvModal(true)}
-          onPond={() => showToast('🐟 Câu cá — +1.2π mỗi 6h!')}
+          onPond={() => setFishModal(true)}
+          onHenHouse={() => setHenModal(true)}
         />
 
         {/* PLOT GRIDS — dùng plots của bạn khi thăm, plots của mình khi ở nhà */}
@@ -917,18 +838,46 @@ export default function LangPi() {
         />
 
         {/* Character */}
-        <div className="absolute pointer-events-none z-50 transition-all duration-[350ms] ease-in-out"
+        <div className="absolute pointer-events-none z-50 transition-all duration-[600ms] ease-in-out"
              style={{ left: `${visitingState ? visitingState.charPos.x : charPos.x}%`,
                       top:  `${visitingState ? visitingState.charPos.y : charPos.y}%` }}>
-          <div className="relative">
-            <span className="char-anim block text-center text-3xl drop-shadow-md">
-              {visitingState ? '🧑‍🌾' : '🧑‍🌾'}
-            </span>
-            <div className="absolute -top-1.5 -right-2 bg-yellow-400 text-amber-900 text-[7px] font-black px-1 rounded-md border border-yellow-300">
-              {visitingState ? visitingState.username.slice(0,4) : 'Lv7'}
+          <div className="relative flex flex-col items-center">
+            {/* Sprite nhân vật */}
+            {visitingState ? (
+              <span className="char-anim block text-center text-3xl drop-shadow-md">🧑‍🌾</span>
+            ) : (
+              <img
+                src={gender === 'female'
+                  ? (isWalking
+                    ? (walkFrame === 0 ? '/NewSprite4.png' : walkFrame === 1 ? '/NewSprite5.png' : '/NewSprite6.png')
+                    : '/NewSprite4.png')
+                  : (isWalking
+                    ? (walkFrame === 0 ? '/NewSprite.png' : walkFrame === 1 ? '/NewSprite2.png' : '/NewSprite3.png')
+                    : '/NewSprite.png')}
+                alt="character"
+                className="char-anim"
+                style={{
+                  width: 54,
+                  height: 68,
+                  objectFit: 'contain',
+                  objectPosition: 'bottom',
+                  transform: facingLeft ? 'scaleX(-1)' : 'scaleX(1)',
+                  filter: 'drop-shadow(0 3px 4px rgba(0,0,0,0.4))',
+                  imageRendering: 'pixelated',
+                  transition: 'transform 0.1s',
+                  transformOrigin: 'bottom center',
+                }}
+              />
+            )}
+            {/* Badge tên */}
+            <div className="absolute -top-4 left-1/2 -translate-x-1/2 whitespace-nowrap
+              bg-yellow-400 text-amber-900 text-[7px] font-black px-1.5 py-0.5
+              rounded-md border border-yellow-300 shadow">
+              {username.slice(0, 8)}
             </div>
           </div>
-          <div className="w-4 h-1.5 bg-black/18 rounded-full mx-auto blur-[2px]" />
+          {/* Bóng dưới chân */}
+          <div className="w-5 h-1.5 bg-black/25 rounded-full mx-auto blur-[2px] mt-0.5" />
         </div>
 
         {/* Popup khi đang THĂM vườn — 3 action: tưới, bắt sâu, trộm */}
@@ -1027,7 +976,29 @@ export default function LangPi() {
           )
         })()}
 
-        {/* Coin FX */}
+        {/* GÀ CHẠY TRONG VƯỜN */}
+        {chickens.map((c, i) => {
+          const now = Date.now()
+          const isMature = now >= c.matureAt
+          const emoji = isMature ? '🐔' : '🐣'
+          // Mỗi con gà chạy ở vị trí khác nhau trong vùng vườn
+          const vw = typeof window !== 'undefined' ? window.innerWidth : 390
+          const zoneAW = Math.floor(vw * 0.44)
+          const baseX = ((zoneAW + 20) / vw * 100) + (i % 2) * 15 + 5
+          const baseY = 55 + Math.floor(i / 2) * 12
+          return (
+            <div key={c.id} className="absolute pointer-events-none z-[40]"
+                 style={{ left: `${baseX}%`, top: `${baseY}%`,
+                          animation: `fishSwim ${3 + i * 0.7}s linear ${i * 1.2}s infinite` }}>
+              <span style={{ fontSize: isMature ? 18 : 13 }}>{emoji}</span>
+              {c.eggs > 0 && (
+                <div className="absolute -top-3 -right-2 bg-yellow-400 text-yellow-900 text-[7px] font-black w-4 h-4 rounded-full flex items-center justify-center animate-bounce">
+                  {c.eggs}
+                </div>
+              )}
+            </div>
+          )
+        })}
         {coins.map(c => (
           <div key={c.id} className="fixed pointer-events-none z-[600] font-black text-yellow-400 text-sm"
                style={{ left: c.x, top: c.y, animation: 'coinUp 0.9s ease forwards',
@@ -1116,6 +1087,208 @@ export default function LangPi() {
                       className="w-full bg-gradient-to-br from-green-500 to-green-700 text-white font-black py-3 rounded-xl shadow-[0_4px_0_#1b5e20] active:translate-y-1 active:shadow-none">
                 Đã hiểu rồi! 👍
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* HỒ CÁ MODAL */}
+      {fishModal && (
+        <div className="fixed inset-0 z-[650] flex items-end justify-center bg-black/60 backdrop-blur-sm"
+             onClick={() => setFishModal(false)}>
+          <div className="bg-white rounded-t-3xl w-full max-w-sm shadow-2xl border-t-4 border-blue-400 pb-8"
+               onClick={e => e.stopPropagation()}>
+            <div className="flex justify-center pt-2 pb-1"><div className="w-10 h-1 bg-gray-200 rounded-full"/></div>
+            <div className="px-5 pt-2">
+              <h2 className="text-center font-black text-lg mb-1" style={{ fontFamily:"'Baloo 2',cursive" }}>🐟 Hồ Cá</h2>
+              {/* Thả cá */}
+              {(inventory['🐟'] || 0) > 0 && (
+                <button onClick={() => {
+                  const now = Date.now()
+                  const newFish: Fish = { id: ++fishId.current, placedAt: now, fedAt: now, readyAt: now + FISH_GROW_MS, name: 'Cá' }
+                  setFish(f => [...f, newFish])
+                  setInventory(inv => {
+                    const n = (inv['🐟'] || 0) - 1
+                    return n <= 0 ? (() => { const {['🐟']:_, ...r} = inv; return r })() : { ...inv, '🐟': n }
+                  })
+                  showToast('🐟 Thả cá vào hồ!')
+                  setFishModal(false)
+                }} className="w-full bg-blue-500 text-white font-black py-2.5 rounded-xl mb-3 active:scale-95">
+                  🐟 Thả cá con vào hồ (còn {inventory['🐟'] || 0} con)
+                </button>
+              )}
+              {/* Cho ăn */}
+              {fish.length > 0 && (inventory['🌾'] || 0) > 0 && (
+                <button onClick={() => {
+                  const now = Date.now()
+                  setFish(f => f.map(c => ({ ...c, fedAt: now, readyAt: c.readyAt - 30 * 60 * 1000 })))
+                  setInventory(inv => {
+                    const n = (inv['🌾'] || 0) - 1
+                    return n <= 0 ? (() => { const {['🌾']:_, ...r} = inv; return r })() : { ...inv, '🌾': n }
+                  })
+                  showToast('🌾 Cho cá ăn! -30 phút thời gian nuôi')
+                  setFishModal(false)
+                }} className="w-full bg-green-500 text-white font-black py-2.5 rounded-xl mb-3 active:scale-95">
+                  🌾 Cho cá ăn (còn {inventory['🌾'] || 0} túi)
+                </button>
+              )}
+              {/* Danh sách cá */}
+              <div className="flex flex-col gap-2 max-h-48 overflow-y-auto mb-3">
+                {fish.length === 0 && <p className="text-center text-xs text-slate-400 py-4">Hồ trống! Mua cá con ở cửa hàng 🛍️</p>}
+                {fish.map(f => {
+                  const now = Date.now()
+                  const ready = now >= f.readyAt
+                  const remaining = Math.max(0, f.readyAt - now)
+                  const hours = Math.floor(remaining / 3600000)
+                  const mins = Math.floor((remaining % 3600000) / 60000)
+                  return (
+                    <div key={f.id} className={`flex items-center gap-3 p-2.5 rounded-xl border-2 ${ready ? 'border-green-400 bg-green-50' : 'border-blue-200 bg-blue-50'}`}>
+                      <span className="text-2xl">{ready ? '🐠' : '🐟'}</span>
+                      <div className="flex-1">
+                        <div className="text-xs font-black">{f.name}</div>
+                        {ready ? <div className="text-[10px] text-green-600 font-bold">✅ Sẵn sàng bán!</div>
+                               : <div className="text-[10px] text-slate-500">⏱ Còn {hours}h{mins}m</div>}
+                      </div>
+                      {ready && (
+                        <button onClick={() => {
+                          setPi(b => Math.round((b + FISH_SELL_REWARD) * 100) / 100)
+                          setFish(fs => fs.filter(x => x.id !== f.id))
+                          showToast(`🐠 Bán cá +${FISH_SELL_REWARD}π!`)
+                        }} className="bg-green-600 text-white text-[10px] font-black px-2.5 py-1.5 rounded-lg active:scale-95">
+                          Bán +{FISH_SELL_REWARD}π
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+              <button onClick={() => setFishModal(false)} className="w-full bg-slate-100 text-slate-600 font-black py-2.5 rounded-xl active:scale-95">Đóng</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TỔ GÀ MODAL */}
+      {henModal && (
+        <div className="fixed inset-0 z-[650] flex items-end justify-center bg-black/60 backdrop-blur-sm"
+             onClick={() => setHenModal(false)}>
+          <div className="bg-white rounded-t-3xl w-full max-w-sm shadow-2xl border-t-4 border-yellow-400 pb-8"
+               onClick={e => e.stopPropagation()}>
+            <div className="flex justify-center pt-2 pb-1"><div className="w-10 h-1 bg-gray-200 rounded-full"/></div>
+            <div className="px-5 pt-2">
+              <h2 className="text-center font-black text-lg mb-1" style={{ fontFamily:"'Baloo 2',cursive" }}>🐔 Tổ Gà</h2>
+              {/* Thả gà */}
+              {(inventory['🐣'] || 0) > 0 && (
+                <button onClick={() => {
+                  const now = Date.now()
+                  const newChicken: Chicken = { id: ++chickenId.current, placedAt: now, fedAt: now, matureAt: now + CHICKEN_MATURE_MS, lastEggAt: now + CHICKEN_MATURE_MS, eggs: 0 }
+                  setChickens(c => [...c, newChicken])
+                  setInventory(inv => {
+                    const n = (inv['🐣'] || 0) - 1
+                    return n <= 0 ? (() => { const {['🐣']:_, ...r} = inv; return r })() : { ...inv, '🐣': n }
+                  })
+                  showToast('🐣 Thả gà vào tổ!')
+                  setHenModal(false)
+                }} className="w-full bg-yellow-500 text-white font-black py-2.5 rounded-xl mb-3 active:scale-95">
+                  🐣 Thả gà con vào tổ (còn {inventory['🐣'] || 0} con)
+                </button>
+              )}
+              {/* Cho ăn */}
+              {chickens.length > 0 && (inventory['🌾'] || 0) > 0 && (
+                <button onClick={() => {
+                  setChickens(cs => cs.map(c => ({ ...c, fedAt: Date.now() })))
+                  setInventory(inv => {
+                    const n = (inv['🌾'] || 0) - 1
+                    return n <= 0 ? (() => { const {['🌾']:_, ...r} = inv; return r })() : { ...inv, '🌾': n }
+                  })
+                  showToast('🌾 Cho gà ăn!')
+                  setHenModal(false)
+                }} className="w-full bg-green-500 text-white font-black py-2.5 rounded-xl mb-3 active:scale-95">
+                  🌾 Cho gà ăn (còn {inventory['🌾'] || 0} túi)
+                </button>
+              )}
+              {/* Danh sách gà */}
+              <div className="flex flex-col gap-2 max-h-48 overflow-y-auto mb-3">
+                {chickens.length === 0 && <p className="text-center text-xs text-slate-400 py-4">Tổ trống! Mua gà con ở cửa hàng 🛍️</p>}
+                {chickens.map(c => {
+                  const now = Date.now()
+                  const mature = now >= c.matureAt
+                  const remaining = Math.max(0, c.matureAt - now)
+                  const hours = Math.floor(remaining / 3600000)
+                  return (
+                    <div key={c.id} className={`flex items-center gap-3 p-2.5 rounded-xl border-2 ${mature ? 'border-yellow-400 bg-yellow-50' : 'border-slate-200 bg-slate-50'}`}>
+                      <span className="text-2xl">{mature ? '🐔' : '🐣'}</span>
+                      <div className="flex-1">
+                        <div className="text-xs font-black">{mature ? 'Gà mái' : 'Gà con'}</div>
+                        {mature ? <div className="text-[10px] text-yellow-600">🥚 {c.eggs} trứng</div>
+                                : <div className="text-[10px] text-slate-500">⏱ Trưởng thành sau {hours}h</div>}
+                      </div>
+                      {mature && c.eggs > 0 && (
+                        <button onClick={() => {
+                          const earn = Math.round(c.eggs * EGG_SELL_REWARD * 100) / 100
+                          setPi(b => Math.round((b + earn) * 100) / 100)
+                          setChickens(cs => cs.map(x => x.id === c.id ? { ...x, eggs: 0 } : x))
+                          showToast(`🥚 Thu ${c.eggs} trứng +${earn}π!`)
+                        }} className="bg-yellow-500 text-white text-[10px] font-black px-2.5 py-1.5 rounded-lg active:scale-95">
+                          Thu {c.eggs}🥚
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+              <button onClick={() => setHenModal(false)} className="w-full bg-slate-100 text-slate-600 font-black py-2.5 rounded-xl active:scale-95">Đóng</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* GENDER PICK MODAL */}
+      {showGenderPick && (
+        <div className="fixed inset-0 z-[800] flex items-center justify-center"
+             style={{ background: 'linear-gradient(135deg,rgba(20,10,40,0.95),rgba(40,15,70,0.97))' }}>
+          <div className="bg-white rounded-3xl mx-6 shadow-2xl border-4 border-purple-300 max-w-sm w-full overflow-hidden">
+            {/* Header */}
+            <div className="bg-gradient-to-br from-purple-500 to-pink-500 px-6 py-5 text-center">
+              <div className="text-4xl mb-2">👤</div>
+              <div className="text-white font-black text-lg" style={{ fontFamily:"'Baloo 2',cursive" }}>
+                Chào mừng đến Làng Pi!
+              </div>
+              <div className="text-white/80 text-xs mt-1">Bạn muốn chơi với nhân vật nào?</div>
+            </div>
+            {/* Chọn */}
+            <div className="p-5 flex gap-4">
+              {/* Nam */}
+              <button
+                onClick={() => {
+                  setGender('male')
+                  setShowGenderPick(false)
+                }}
+                className="flex-1 flex flex-col items-center gap-2 p-4 rounded-2xl border-3 border-blue-200 bg-blue-50 active:scale-95 transition-all hover:border-blue-400"
+                style={{ border: '3px solid #bfdbfe' }}
+              >
+                <img src="/NewSprite.png" alt="Nam"
+                  style={{ width: 64, height: 80, objectFit:'contain', imageRendering:'pixelated',
+                           filter:'drop-shadow(0 3px 5px rgba(0,0,0,0.3))' }}/>
+                <div className="font-black text-blue-700 text-sm">👦 Nam</div>
+              </button>
+              {/* Nữ */}
+              <button
+                onClick={() => {
+                  setGender('female')
+                  setShowGenderPick(false)
+                }}
+                className="flex-1 flex flex-col items-center gap-2 p-4 rounded-2xl border-3 border-pink-200 bg-pink-50 active:scale-95 transition-all hover:border-pink-400"
+                style={{ border: '3px solid #fbcfe8' }}
+              >
+                <img src="/NewSprite4.png" alt="Nữ"
+                  style={{ width: 64, height: 80, objectFit:'contain', imageRendering:'pixelated',
+                           filter:'drop-shadow(0 3px 5px rgba(0,0,0,0.3))' }}/>
+                <div className="font-black text-pink-600 text-sm">👧 Nữ</div>
+              </button>
+            </div>
+            <div className="text-center text-[10px] text-slate-400 pb-4">
+              ✨ Lựa chọn này sẽ không thay đổi được
             </div>
           </div>
         </div>
@@ -1227,8 +1400,8 @@ export default function LangPi() {
           <div className="px-4 pt-2 pb-1">
             {/* Tabs */}
             <div className="flex gap-2 mb-3">
-              {([['seeds','🌱 Hạt giống'],['fert','⚗️ Phân bón'],['land','🟫 Mua đất']] as const).map(([tab, label]) => (
-                <button key={tab} onClick={() => setShopTab(tab as 'seeds'|'fert'|'land')}
+              {([['seeds','🌱 Hạt giống'],['fert','⚗️ Phân bón'],['land','🟫 Mua đất'],['animals','🐣 Chăn nuôi']] as const).map(([tab, label]) => (
+                <button key={tab} onClick={() => setShopTab(tab as 'seeds'|'fert'|'land'|'animals')}
                         className={`flex-1 py-1.5 rounded-xl text-[11px] font-black border-2 transition-all
                           ${shopTab === tab ? 'bg-green-600 text-white border-green-700' : 'bg-white text-slate-500 border-slate-200'}`}>
                   {label}
@@ -1334,6 +1507,73 @@ export default function LangPi() {
               </div>
             )}
 
+            {/* ── CHĂN NUÔI ── */}
+            {shopTab === 'animals' && (
+              <div className="flex flex-col gap-3">
+                <p className="text-center text-xs text-slate-400 mb-1">Mua giống về nuôi kiếm Pi!</p>
+
+                {/* Cá con */}
+                <div className="flex items-center gap-3 rounded-xl p-3 border-2 border-blue-200 bg-blue-50">
+                  <span className="text-3xl">🐟</span>
+                  <div className="flex-1 text-left">
+                    <div className="text-xs font-black">Cá con ({fish.length}/5)</div>
+                    <div className="text-[10px] text-slate-500">Nuôi 3 ngày → bán được +{FISH_SELL_REWARD}π/con</div>
+                    <div className="text-[9px] text-orange-500 mt-0.5">Không cho ăn 8h → bán được 50%</div>
+                  </div>
+                  <button onClick={() => {
+                    if (piBalance < 0.2) { showToast('❌ Cần 0.2π!'); return }
+                    if (fish.length >= 5) { showToast('❌ Ao đầy! Tối đa 5 con'); return }
+                    setPi(b => Math.round((b - 0.2) * 100) / 100)
+                    const now = Date.now()
+                    setFish(f => [...f, { id: ++fishId.current, placedAt: now, fedAt: now, readyAt: now + FISH_GROW_MS, name: '🐟' }])
+                    showToast('🐟 Đã thả cá vào ao!')
+                    setShopModal(false)
+                  }} className="bg-blue-600 text-white text-xs font-black px-3 py-2 rounded-xl active:scale-95">
+                    π0.2
+                  </button>
+                </div>
+
+                {/* Gà con */}
+                <div className="flex items-center gap-3 rounded-xl p-3 border-2 border-yellow-200 bg-yellow-50">
+                  <span className="text-3xl">🐣</span>
+                  <div className="flex-1 text-left">
+                    <div className="text-xs font-black">Gà con ({chickens.length}/5)</div>
+                    <div className="text-[10px] text-slate-500">Sau 1 ngày → đẻ trứng 12h/quả</div>
+                    <div className="text-[9px] text-orange-500 mt-0.5">Không cho ăn 8h → đẻ chậm 2x</div>
+                  </div>
+                  <button onClick={() => {
+                    if (piBalance < 0.3) { showToast('❌ Cần 0.3π!'); return }
+                    if (chickens.length >= 5) { showToast('❌ Tổ đầy! Tối đa 5 con'); return }
+                    setPi(b => Math.round((b - 0.3) * 100) / 100)
+                    const now = Date.now()
+                    setChickens(c => [...c, { id: ++chickenId.current, placedAt: now, fedAt: now, matureAt: now + CHICKEN_MATURE_MS, lastEggAt: now + CHICKEN_MATURE_MS, eggs: 0 }])
+                    showToast('🐣 Đã thả gà vào tổ!')
+                    setShopModal(false)
+                  }} className="bg-yellow-500 text-white text-xs font-black px-3 py-2 rounded-xl active:scale-95">
+                    π0.3
+                  </button>
+                </div>
+
+                {/* Thức ăn */}
+                <div className="flex items-center gap-3 rounded-xl p-3 border-2 border-green-200 bg-green-50">
+                  <span className="text-3xl">🌾</span>
+                  <div className="flex-1 text-left">
+                    <div className="text-xs font-black">Thức ăn tổng hợp</div>
+                    <div className="text-[10px] text-slate-500">Dùng cho cả gà lẫn cá · Có {inventory['🌾'] || 0} túi</div>
+                    <div className="text-[9px] text-green-600 mt-0.5">Mua 5 túi / lần</div>
+                  </div>
+                  <button onClick={() => {
+                    if (piBalance < 0.05) { showToast('❌ Cần 0.05π!'); return }
+                    setPi(b => Math.round((b - 0.05) * 100) / 100)
+                    setInventory(inv => ({ ...inv, '🌾': (inv['🌾'] || 0) + 5 }))
+                    showToast('✅ Mua 5 túi thức ăn!')
+                  }} className="bg-green-600 text-white text-xs font-black px-3 py-2 rounded-xl active:scale-95">
+                    π0.05×5
+                  </button>
+                </div>
+              </div>
+            )}
+
           </div>
         </DrawerContent>
       </Drawer>
@@ -1379,7 +1619,143 @@ export default function LangPi() {
 
 
 
-      {/* LỖI KHÔNG VÀO ĐƯỢC PIBROWSER */}
+      {/* HỒ CÁ MODAL */}
+      <Drawer open={fishModal} onOpenChange={setFishModal}>
+        <DrawerContent className="rounded-t-3xl max-h-[85vh]"
+          style={{ background: 'linear-gradient(180deg,#e0f7fa,#b2ebf2)' }}>
+          <DrawerHeader className="pb-0">
+            <DrawerTitle className="text-center font-black text-lg">🐟 Hồ Cá</DrawerTitle>
+          </DrawerHeader>
+          <div className="px-4 pt-2 pb-6 overflow-y-auto">
+            {fish.length === 0 ? (
+              <div className="text-center py-8">
+                <div className="text-5xl mb-3">🌊</div>
+                <p className="text-sm font-black text-slate-600 mb-1">Hồ đang trống!</p>
+                <p className="text-xs text-slate-400 mb-4">Mua cá con ở cửa hàng để thả vào</p>
+                <button onClick={() => { setFishModal(false); setShopTab('animals'); setShopModal(true) }}
+                        className="bg-blue-600 text-white font-black text-sm px-6 py-2.5 rounded-xl active:scale-95">
+                  🛍️ Mua cá con
+                </button>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                {fish.map((f, i) => {
+                  const now = Date.now()
+                  const isReady = now >= f.readyAt
+                  const progress = isReady ? 100 : Math.min(99, ((now - f.placedAt) / FISH_GROW_MS) * 100)
+                  const fedHoursAgo = Math.round((now - f.fedAt) / (60 * 60 * 1000))
+                  const needsFood = fedHoursAgo >= 8
+                  return (
+                    <div key={f.id} className="bg-white rounded-2xl p-3 border-2 border-blue-200 shadow-sm">
+                      <div className="flex items-center gap-3 mb-2">
+                        <span className="text-3xl">{isReady ? '🐠' : '🐟'}</span>
+                        <div className="flex-1">
+                          <div className="text-xs font-black">Cá #{i + 1} {isReady ? '✅ Sẵn sàng bán!' : ''}</div>
+                          <div className="text-[10px] text-slate-500">
+                            {isReady ? 'Bán được ' + FISH_SELL_REWARD + 'π' : `Còn ${msToTimeString(f.readyAt - now)}`}
+                            {needsFood && <span className="text-red-500 ml-1">· Đói rồi! -50% giá</span>}
+                          </div>
+                          <div className="mt-1 h-1.5 bg-blue-100 rounded-full overflow-hidden">
+                            <div className="h-full bg-blue-500 rounded-full transition-all"
+                                 style={{ width: `${progress}%` }} />
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        <button onClick={() => feedFish(f.id)}
+                                className="flex-1 bg-green-500 text-white text-[10px] font-black py-1.5 rounded-xl active:scale-95">
+                          🌾 Cho ăn {fedHoursAgo > 0 ? `(${fedHoursAgo}h trước)` : ''}
+                        </button>
+                        {isReady && (
+                          <button onClick={() => { sellFish(f.id) }}
+                                  className="flex-1 bg-blue-600 text-white text-[10px] font-black py-1.5 rounded-xl active:scale-95">
+                            💰 Bán cá
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+                {fish.length < 5 && (
+                  <button onClick={() => { setFishModal(false); setShopTab('animals'); setShopModal(true) }}
+                          className="w-full py-2.5 rounded-xl border-2 border-dashed border-blue-300 text-blue-500 text-xs font-black active:scale-95">
+                    + Thêm cá ({fish.length}/5)
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </DrawerContent>
+      </Drawer>
+
+      {/* TỔ GÀ MODAL */}
+      <Drawer open={henModal} onOpenChange={setHenModal}>
+        <DrawerContent className="rounded-t-3xl max-h-[85vh]"
+          style={{ background: 'linear-gradient(180deg,#fff8e1,#ffecb3)' }}>
+          <DrawerHeader className="pb-0">
+            <DrawerTitle className="text-center font-black text-lg">🐔 Tổ Gà</DrawerTitle>
+          </DrawerHeader>
+          <div className="px-4 pt-2 pb-6 overflow-y-auto">
+            {chickens.length === 0 ? (
+              <div className="text-center py-8">
+                <div className="text-5xl mb-3">🪹</div>
+                <p className="text-sm font-black text-slate-600 mb-1">Tổ đang trống!</p>
+                <p className="text-xs text-slate-400 mb-4">Mua gà con ở cửa hàng để thả vào</p>
+                <button onClick={() => { setHenModal(false); setShopTab('animals'); setShopModal(true) }}
+                        className="bg-yellow-500 text-white font-black text-sm px-6 py-2.5 rounded-xl active:scale-95">
+                  🛍️ Mua gà con
+                </button>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                {chickens.map((c, i) => {
+                  const now = Date.now()
+                  const isMature = now >= c.matureAt
+                  const fedHoursAgo = Math.round((now - c.fedAt) / (60 * 60 * 1000))
+                  const needsFood = fedHoursAgo >= 8
+                  const timeToMature = isMature ? 0 : c.matureAt - now
+                  const nextEggTime = isMature && now < c.lastEggAt + EGG_INTERVAL_MS
+                    ? msToTimeString(c.lastEggAt + EGG_INTERVAL_MS - now) : null
+                  return (
+                    <div key={c.id} className="bg-white rounded-2xl p-3 border-2 border-yellow-200 shadow-sm">
+                      <div className="flex items-center gap-3 mb-2">
+                        <span className="text-3xl">{isMature ? '🐔' : '🐣'}</span>
+                        <div className="flex-1">
+                          <div className="text-xs font-black">
+                            Gà #{i + 1} {isMature ? '· Đang đẻ trứng' : `· Còn ${msToTimeString(timeToMature)} lớn`}
+                          </div>
+                          <div className="text-[10px] text-slate-500">
+                            {c.eggs > 0 ? `🥚 ${c.eggs} trứng · +${(c.eggs * EGG_SELL_REWARD).toFixed(2)}π` : nextEggTime ? `Trứng tiếp: ${nextEggTime}` : 'Chờ đẻ...'}
+                            {needsFood && <span className="text-red-500 ml-1">· Đói! Đẻ chậm 2x</span>}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        <button onClick={() => feedChicken(c.id)}
+                                className="flex-1 bg-green-500 text-white text-[10px] font-black py-1.5 rounded-xl active:scale-95">
+                          🌾 Cho ăn {fedHoursAgo > 0 ? `(${fedHoursAgo}h)` : ''}
+                        </button>
+                        {c.eggs > 0 && (
+                          <button onClick={() => collectEggs(c.id)}
+                                  className="flex-1 bg-yellow-500 text-white text-[10px] font-black py-1.5 rounded-xl active:scale-95">
+                            🥚 Thu {c.eggs} trứng
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+                {chickens.length < 5 && (
+                  <button onClick={() => { setHenModal(false); setShopTab('animals'); setShopModal(true) }}
+                          className="w-full py-2.5 rounded-xl border-2 border-dashed border-yellow-300 text-yellow-600 text-xs font-black active:scale-95">
+                    + Thêm gà ({chickens.length}/5)
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </DrawerContent>
+      </Drawer>
       {username === '❌' && (
         <div className="fixed inset-0 z-[900] flex flex-col items-center justify-center px-8"
              style={{ background: 'linear-gradient(135deg,#1a0533 0%,#2d0a5e 50%,#1a0533 100%)' }}>
@@ -1398,311 +1774,5 @@ export default function LangPi() {
         </div>
       )}
     </div>
-  )
-}
-
-// ─── ROAD FLOWERS ─────────────────────────────────────────────────────
-function RoadFlowers() {
-  const roadY = typeof window !== 'undefined' ? (window.innerHeight * 0.20 + 15 + 5) : 120
-  return (
-    <>
-      {[['🌼',7,'0s'],['🌸',32,'0.6s'],['🌼',64,'1.2s'],['💐',87,'0.9s']].map(([f,pct,delay],i) => (
-        <span key={i} className="absolute text-[9px] pointer-events-none"
-              style={{ top: roadY + (i%2)*2, left:`${pct}%`,
-                       animation: `leafSway 3s ease-in-out ${delay} infinite` }}>
-          {f}
-        </span>
-      ))}
-    </>
-  )
-}
-
-// ─── ZONES & BUILDINGS ────────────────────────────────────────────────
-function ZonesAndBuildings({ piBalance, onKitchen, onWarehouse, onPond }: {
-  piBalance: number
-  onKitchen: () => void
-  onWarehouse: () => void
-  onPond: () => void
-}) {
-  // Computed from viewport
-  const vh = typeof window !== 'undefined' ? window.innerHeight : 700
-  const vw = typeof window !== 'undefined' ? window.innerWidth : 390
-  const greenY = Math.round(vh * 0.20) + 41
-  const greenH = vh - greenY - 111
-  const zoneHF = greenH - 30
-  const zoneAW = Math.floor(vw * 0.44)
-  const zoneBCW = Math.floor((vw - zoneAW - 26) / 2)
-  const zoneYS = greenY + 4
-  const bldY = zoneYS + 20
-
-  return (
-    <>
-      {/* Zone borders */}
-      {[
-        { x:0,           w:zoneAW,   lbl:'🏡 Khu nhà & hồ' },
-        { x:zoneAW+13,   w:zoneBCW,  lbl:'🌱 Vườn 1' },
-        { x:zoneAW+13+zoneBCW+13, w:zoneBCW, lbl:'🌱 Vườn 2' },
-      ].map((z, i) => (
-        <div key={i} className="absolute rounded-lg border-[3px] border-green-800 pointer-events-none"
-             style={{ left:z.x, top:zoneYS, width:z.w, height:zoneHF,
-                      boxShadow:'inset 0 0 18px rgba(0,0,0,0.07),0 3px 8px rgba(0,0,0,0.13)',
-                      background:'radial-gradient(circle at 12% 20%,rgba(255,255,255,0.07) 2px,transparent 3px),linear-gradient(155deg,#6abf40 0%,#5aaf30 45%,#4a9f20 100%)' }}>
-          <div className="text-center text-[8px] font-black text-white/65 uppercase tracking-widest mt-1">{z.lbl}</div>
-        </div>
-      ))}
-
-      {/* Vertical dividers */}
-      {[zoneAW, zoneAW+13+zoneBCW].map((x, i) => (
-        <div key={i} className="absolute pointer-events-none"
-             style={{ left:x, top:greenY, width:13, bottom:111,
-                      background:'#c8a46e' }} />
-      ))}
-
-      {/* ── NHÀ BẾP — trái khu nhà ── */}
-      <button onClick={onKitchen} className="absolute z-[15] active:brightness-110"
-              style={{ left: 4, top: zoneYS + 14 }}>
-        <Building type="kitchen" />
-      </button>
-
-      {/* ── NHÀ KHO — phải khu nhà ── */}
-      <button onClick={onWarehouse} className="absolute z-[15] active:brightness-110"
-              style={{ left: zoneAW - 72, top: zoneYS + 14 }}>
-        <Building type="warehouse" />
-      </button>
-
-      {/* ── TƯỢNG ĐÀI PI — giữa nhà và hồ cá ── */}
-      <div className="absolute z-[16] pointer-events-none flex flex-col items-center"
-           style={{ left: Math.round(zoneAW / 2) - 30, top: zoneYS + 115 }}>
-        <div style={{ position:'absolute', width:60, height:60, borderRadius:'50%', top:0,
-                      background:'radial-gradient(circle,rgba(160,100,255,0.6) 0%,transparent 70%)',
-                      animation:'piGlow 2.5s ease-in-out infinite' }} />
-        <span style={{
-          fontSize:44, lineHeight:1, fontWeight:900, fontFamily:"'Baloo 2',cursive",
-          background:'linear-gradient(180deg,#f0d0ff 0%,#c084fc 35%,#9333ea 70%,#6b21a8 100%)',
-          WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent',
-          filter:'drop-shadow(0 0 8px rgba(168,85,247,0.95)) drop-shadow(0 3px 0 rgba(0,0,0,0.5))',
-          animation:'piFloat 3s ease-in-out infinite', position:'relative', zIndex:2,
-        }}>π</span>
-        <div style={{ width:52, height:14, marginTop:1,
-                      background:'linear-gradient(180deg,#8b7aa0,#4a3f5c)',
-                      borderRadius:'3px 3px 0 0', border:'1px solid #a990c0',
-                      display:'flex', alignItems:'center', justifyContent:'center',
-                      boxShadow:'0 2px 6px rgba(0,0,0,0.5)' }}>
-          <span style={{ fontSize:5.5, fontWeight:900, color:'#f0d0ff', letterSpacing:1 }}>LÀNG PI</span>
-        </div>
-        <div style={{ width:60, height:6, background:'linear-gradient(180deg,#5a4f6a,#3a3048)',
-                      borderRadius:'0 0 4px 4px', boxShadow:'0 4px 8px rgba(0,0,0,0.6)' }} />
-        {[[-22,3,8,14],[-12,-1,6,10],[12,-1,6,10],[22,3,8,14]].map(([x,y,w,h],i)=>(
-          <div key={i} style={{ position:'absolute', bottom:4, left:`calc(50% + ${x}px)`,
-            width:w, height:h, background:'linear-gradient(180deg,#d8b4fe,#7c3aed)',
-            clipPath:'polygon(50% 0%,100% 100%,0% 100%)', opacity:0.85 }} />
-        ))}
-      </div>
-
-      {/* ── HỒ CÁ ── */}
-      <Pond onTap={onPond} zoneAW={zoneAW} zoneYS={zoneYS} zoneHF={zoneHF} />
-    </>
-  )
-}
-
-// ─── BUILDING ─────────────────────────────────────────────────────────
-function Building({ type }: { type: 'kitchen' | 'warehouse' }) {
-  const isK = type === 'kitchen'
-  return (
-    <div className="relative w-[68px]">
-      {/* Chimney (kitchen only) */}
-      {isK && (
-        <div className="absolute right-[18%] bg-stone-500 border-2 border-stone-700 z-10"
-             style={{ bottom:'100%', width:11, height:16, marginBottom:-2 }}>
-          <span className="absolute text-[9px]" style={{ animation:'smokeMain 2.2s ease-out infinite', bottom:'100%', left:0 }}>💨</span>
-        </div>
-      )}
-      {/* Triangle peak (warehouse) */}
-      {!isK && (
-        <div className="absolute left-1/2 -translate-x-1/2 z-[2]"
-             style={{ bottom:'100%', width:0, height:0,
-                      borderLeft:'39px solid transparent', borderRight:'39px solid transparent',
-                      borderBottom:'16px solid #546e7a' }} />
-      )}
-      {/* Roof */}
-      <div className="absolute left-[-4px] right-[-4px] z-[1]"
-           style={{ bottom: isK ? '100%' : 'calc(48px + 25px)', height: isK ? 22 : 25,
-                    background: isK ? 'linear-gradient(180deg,#ef9a9a,#e57373)' : 'linear-gradient(180deg,#b0bec5,#90a4ae)',
-                    border: `2px solid ${isK ? '#c62828' : '#546e7a'}`, borderBottom:'none', borderRadius:'3px 3px 0 0' }}>
-        {isK && (
-          <div className="absolute bottom-full left-1/2 -translate-x-1/2"
-               style={{ width:0, height:0, borderLeft:'17px solid transparent', borderRight:'17px solid transparent', borderBottom:`11px solid #c62828` }} />
-        )}
-        {!isK && (
-          <div className="absolute inset-0"
-               style={{ background:'repeating-linear-gradient(90deg,transparent 0,transparent 7px,rgba(0,0,0,0.07) 7px,rgba(0,0,0,0.07) 8px)' }} />
-        )}
-      </div>
-      {/* Body */}
-      <div className="relative border-[3px] border-amber-900 rounded-t-sm"
-           style={{ width:68, height:48, marginTop: isK ? 22 : 48+25,
-                    background: isK ? 'linear-gradient(180deg,#e8c49a,#d4a26a)' : 'linear-gradient(180deg,#d4a26a,#c08040)',
-                    boxShadow:'inset -4px 0 0 rgba(0,0,0,0.12)' }}>
-        {/* Sign */}
-        <div className="absolute -top-[15px] left-1/2 -translate-x-1/2 whitespace-nowrap
-          bg-gradient-to-br from-yellow-200 to-yellow-400 border-2 border-orange-600 rounded-md
-          px-1.5 py-0.5 text-[7px] font-black text-amber-900 shadow">
-          {isK ? 'NHÀ BẾP' : '🏚 NHÀ KHO'}
-        </div>
-        {/* Windows */}
-        <div className="absolute w-3 h-3 top-2 left-[5px] rounded-sm border-2 border-amber-900 bg-gradient-to-br from-sky-200 to-sky-400" />
-        <div className="absolute w-3 h-3 top-2 right-[5px] rounded-sm border-2 border-amber-900 bg-gradient-to-br from-sky-200 to-sky-400" />
-        {/* Door */}
-        <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-[17px] h-6 rounded-t-sm border-2 border-amber-950 bg-gradient-to-b from-amber-800 to-amber-950">
-          <div className="absolute w-1 h-1 rounded-full bg-yellow-400 right-[18%] top-[32%]" style={{ boxShadow:'0 0 3px rgba(255,215,0,0.7)' }} />
-        </div>
-        {/* Decoration */}
-        <span className="absolute bottom-0.5 left-1 text-[10px]">{isK ? '🍳' : '🪣'}</span>
-        <span className="absolute bottom-0.5 right-1 text-[9px]">{isK ? '🔥' : '⚗️'}</span>
-      </div>
-      {/* Enter arrow */}
-      <div className="absolute -bottom-4 left-1/2 text-[8px] font-black text-white text-center arr-anim"
-           style={{ textShadow:'0 1px 2px rgba(0,0,0,0.5)' }}>
-        {isK ? 'Vào' : 'Kho'}<br/><span className="text-yellow-400">▼</span>
-      </div>
-    </div>
-  )
-}
-
-// ─── POND ─────────────────────────────────────────────────────────────
-function Pond({ onTap, zoneAW, zoneYS, zoneHF }: { onTap:()=>void; zoneAW:number; zoneYS:number; zoneHF:number }) {
-  const bldSecH = Math.round(zoneHF * 0.52)
-  const vh = typeof window !== 'undefined' ? window.innerHeight : 700
-  const vw = typeof window !== 'undefined' ? window.innerWidth : 390
-  const pondSize = Math.min(Math.round(zoneAW * 0.74), Math.round(zoneHF * 0.42))
-  const pondX = Math.round((zoneAW - pondSize) / 2)
-  const pondY = zoneYS + bldSecH + 10
-  const FH=20, FW=20, PAD=5
-  const wrapW = pondSize + (PAD+FW)*2
-  const wrapH = pondSize + (PAD+FH)*2
-  const wrapX = pondX - PAD - FW
-  const wrapY = pondY - PAD - FH
-  const gateH = Math.round(wrapH * 0.35)
-  const solidH = wrapH - gateH
-
-  // Tree position
-  const kitchX = Math.round((zoneAW*0.5 - 68)/2 - 2)
-  const treeX = Math.max(4, Math.round((kitchX + 68 + wrapX) / 2) - 22)
-  const treeY2 = wrapY + solidH - 14
-
-  const fenceStyle = {
-    h: {
-      height: FH,
-      backgroundImage: 'repeating-linear-gradient(90deg,#7a4e20 0px,#7a4e20 8px,#c8943a 8px,#e0b060 12px,#c8943a 12px,#c8943a 17px,transparent 17px,transparent 22px)',
-      borderTop: '3px solid #d4a040',
-      borderBottom: '2px solid #7a4010',
-    },
-    v: {
-      width: FW,
-      backgroundImage: 'repeating-linear-gradient(180deg,#7a4e20 0px,#7a4e20 8px,#c8943a 8px,#e0b060 12px,#c8943a 12px,#c8943a 17px,transparent 17px,transparent 22px)',
-      borderLeft: '3px solid #d4a040',
-      borderRight: '2px solid #7a4010',
-    },
-  }
-
-  return (
-    <>
-      {/* Pond tree */}
-      <div className="absolute pointer-events-none tree-sway z-[14]"
-           style={{ left:treeX, top:treeY2 }}>
-        <span className="text-5xl drop-shadow-lg">🌳</span>
-      </div>
-
-      {/* Fence wrapper */}
-      <div className="absolute z-[9]" style={{ left:wrapX, top:wrapY, width:wrapW, height:wrapH }}>
-        {/* Top fence */}
-        <div className="absolute pointer-events-none box-border" style={{ top:0, left:0, width:wrapW, ...fenceStyle.h }} />
-        {/* Right fence */}
-        <div className="absolute pointer-events-none box-border" style={{ top:0, right:0, height:wrapH, ...fenceStyle.v }} />
-        {/* Bottom fence */}
-        <div className="absolute pointer-events-none box-border" style={{ bottom:0, left:0, width:wrapW, ...fenceStyle.h }} />
-        {/* Left fence (gate at bottom) */}
-        <div className="absolute pointer-events-none box-border" style={{ top:0, left:0, height:solidH, ...fenceStyle.v }} />
-      </div>
-
-      {/* Pond itself */}
-      <button onClick={onTap} className="absolute z-[10] rounded-lg overflow-hidden"
-              style={{ left: pondX, top: pondY, width: pondSize, height: pondSize,
-                       background: 'radial-gradient(ellipse at 28% 28%,rgba(255,255,255,0.30) 0%,transparent 55%),radial-gradient(ellipse at 74% 70%,rgba(255,255,255,0.12) 0%,transparent 45%),linear-gradient(160deg,#4dd0e1 0%,#26c6da 35%,#00acc1 60%,#00838f 100%)',
-                       border:'3px solid #006064',
-                       boxShadow:'inset 0 4px 14px rgba(255,255,255,0.20),inset 0 -4px 10px rgba(0,80,100,0.25),0 4px 16px rgba(0,150,180,0.28)' }}>
-        {/* Ripples */}
-        {[[30,35,0.28,'0s','3s'],[60,20,0.18,'1.1s','3.5s'],[18,62,0.15,'2s','4s'],[68,58,0.21,'0.6s','3.2s']].map(([l,t,r,d,dur],i) => {
-          const w = Math.round(pondSize * (r as number))
-          return (
-            <div key={i} className="absolute rounded-full border-2 border-white/40 pointer-events-none"
-                 style={{ left:`${l}%`, top:`${t}%`, width:w, height:Math.round(w*0.55),
-                          marginLeft:-Math.round(w/2), marginTop:-Math.round(w*0.28),
-                          animation:`ripple ${dur} ease-out ${d} infinite` }} />
-          )
-        })}
-        {/* Sparkles */}
-        {[['20%','28%','0s'],['70%','18%','0.9s'],['44%','52%','1.6s'],['14%','68%','2.3s'],['80%','60%','0.4s']].map(([l,t,d],i) => (
-          <i key={i} className="absolute text-white not-italic text-[9px] pointer-events-none"
-             style={{ left:l, top:t, animation:`spark ${1.6+parseFloat(d as string)*0.4}s ease-in-out ${d} infinite` }}>✦</i>
-        ))}
-        {/* Leaves */}
-        {[['16%','58%',0.18,'0s','3.8s'],['50%','50%',0.14,'1.4s','4.2s'],['70%','26%',0.12,'2.2s','3.5s']].map(([l,t,sz,d,dur],i) => (
-          <div key={i} className="absolute pointer-events-none"
-               style={{ left:l as string, top:t as string, fontSize:Math.round(pondSize*(sz as number)),
-                        animation:`leafSway ${dur} ease-in-out ${d} infinite` }}>🍃</div>
-        ))}
-        {/* Fish */}
-        <div className="absolute pointer-events-none text-[11px]"
-             style={{ top:'42%', left:'8%', animation:'fishSwim 5s linear infinite' }}>🐟</div>
-        <div className="absolute pointer-events-none text-[11px]"
-             style={{ top:'62%', left:'38%', animation:'fishSwim 7s linear 2s infinite' }}>🐟</div>
-        {/* Reflection */}
-        <div className="absolute top-0 left-0 right-0 h-[38%] pointer-events-none"
-             style={{ background:'linear-gradient(180deg,rgba(255,255,255,0.16) 0%,transparent 100%)' }} />
-        {/* Label */}
-        <div className="absolute -bottom-4 left-1/2 -translate-x-1/2 text-[8px] font-black text-white/70 whitespace-nowrap pointer-events-none"
-             style={{ textShadow:'0 1px 3px rgba(0,0,0,0.4)' }}>🌊 Hồ nước</div>
-      </button>
-    </>
-  )
-}
-
-// ─── PLOT GRIDS ───────────────────────────────────────────────────────
-function PlotGrids({ plots, onPlotTap }: { plots: Plot[]; onPlotTap: (idx:number, e:React.MouseEvent) => void }) {
-  const vh = typeof window !== 'undefined' ? window.innerHeight : 700
-  const vw = typeof window !== 'undefined' ? window.innerWidth : 390
-  const greenY = Math.round(vh * 0.20) + 41
-  const greenH = vh - greenY - 111
-  const zoneAW = Math.floor(vw * 0.44)
-  const zoneBCW = Math.floor((vw - zoneAW - 26) / 2)
-  const zoneYS = greenY + 4
-  const zoneHF = greenH - 30
-
-  const PAD=5, PG=4, COLS=2
-  const plotW = Math.floor((zoneBCW - PAD*2 - PG) / COLS)
-  const plotH = Math.floor(plotW * 0.88)
-  const rows = Math.floor((zoneHF - 20 + PG) / (plotH + PG))
-  const maxPer = COLS * rows
-
-  const zoneXs = [zoneAW + 13, zoneAW + 13 + zoneBCW + 13]
-
-  return (
-    <>
-      {[0, 1].map(z => {
-        const startIdx = z * maxPer
-        const zPlots = plots.slice(startIdx, startIdx + maxPer)
-        return (
-          <div key={z} className="absolute"
-               style={{ left: zoneXs[z] + PAD, top: zoneYS + 18,
-                        display:'grid', gridTemplateColumns: `repeat(${COLS},${plotW}px)`,
-                        gridAutoRows: plotH, columnGap: PG, rowGap: PG }}>
-            {zPlots.map((p, li) => (
-              <PlotCell key={li} plot={p} onClick={(e) => onPlotTap(startIdx + li, e)} />
-            ))}
-          </div>
-        )
-      })}
-    </>
   )
 }

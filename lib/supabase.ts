@@ -1,7 +1,9 @@
 import { createClient } from '@supabase/supabase-js'
 
-const SUPABASE_URL  = process.env.NEXT_PUBLIC_SUPABASE_URL  || 'https://YOUR_PROJECT.supabase.co'
-const SUPABASE_ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'YOUR_ANON_KEY'
+// ⚠️ Với output: export (static), phải dùng URL trực tiếp
+// Lấy tại: Supabase Dashboard > Settings > API
+const SUPABASE_URL  = 'https://ggdapoglyqgsxmxawddo.supabase.co'
+const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdnZGFwb2dseXFnc3hteGF3ZGRvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY5MDI5OTUsImV4cCI6MjA5MjQ3ODk5NX0.pXoiXRPbX8n64aEKUDQ8hLSUZBmWYzTr7raSFlHp1y4'
 
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON)
 
